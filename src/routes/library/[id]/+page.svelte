@@ -27,6 +27,10 @@
   let error = $state<string | null>(null);
   let currentTime = $state(0);
   let comments = $state<PlayerComment[]>([]);
+  // コメ取得が「決着」したか (成功/失敗/取得不要のいずれかで確定)。
+  // load() リセット直後の一過性 comments=[] で PiP のコメ層を潰さないよう、
+  // mini への updateComments はこのフラグが true になってからのみ走らせる。
+  let commentsSettled = $state(false);
 
   let ngRules = $state<NgRule[]>(listNgRules());
   const ngUnsub = subscribeNgRules(() => (ngRules = listNgRules()));
@@ -77,6 +81,7 @@
     localSrc = null;
     localAudioSrc = null;
     comments = [];
+    commentsSettled = false;
 
     try {
       // 設定と再生情報を並列取得
@@ -115,6 +120,7 @@
         nicoruCount: c.nicoruCount ?? undefined,
         score: c.score ?? undefined,
       }));
+      commentsSettled = true;
       addHistory({
         videoId: result.videoId,
         title: result.title,
@@ -210,6 +216,15 @@
     if (!local || !localSrc) return false;
     // 同じ動画で既に PiP 起動済み (音声引き継ぎ中も含む) なら何もしない。
     if (miniPlayer.active && miniPlayer.source?.videoId === local.videoId) return false;
+    // 別動画が PiP 稼働中ならこのページの Player はマウントされていない。
+    // 再生中でない動画を PiP 化することは無いので、現在の PiP をそのまま維持する。
+    if (
+      miniPlayer.active &&
+      !!miniPlayer.source?.videoId &&
+      miniPlayer.source.videoId !== local.videoId
+    ) {
+      return false;
+    }
     const vid = playerRef?.getVideo();
     const t = vid?.currentTime ?? currentTime ?? 0;
     // 起動時点で再生中だった場合のみ mini の無音ロード→引き継ぎフローを使う。
@@ -259,8 +274,25 @@
       miniPlayer.audioOwned &&
       miniPlayer.source?.videoId === (local?.videoId ?? ''),
   );
+
+  // グローバル単一アクティブ Player 不変条件: PiP が別動画で稼働中なら、ここでも
+  // Player を絶対にマウントしない。audioOwned に関係なく排他する (引き継ぎ中も同様)。
+  // これが無いと PiP (動画 A) + ページ Player (動画 B) で二重再生になる。
+  let pipActiveForOther = $derived(
+    miniPlayer.active &&
+      !!miniPlayer.source?.videoId &&
+      miniPlayer.source.videoId !== (local?.videoId ?? ''),
+  );
+  let pipExpandHref = $derived(miniPlayer.expandHref || '/');
+  let pipOtherTitle = $derived(miniPlayer.title || 'ミニプレイヤー');
+  // PiP 中はミニ側で取得済みコメの方が新しい可能性があるので、ミニ側にも反映。
+  // ただし load() 直後の comments=[] (ローディング中の一過性空配列) で
+  // mini を上書きすると PiP のコメ層が destroy されてしまうので、コメ取得が
+  // 決着 (commentsSettled=true) してからのみ更新する。NG ルールで全件除外
+  // された結果の [] のような「正当な空」は commentsSettled 後に発生するので
+  // このガードを通って mini へ伝播する。
   $effect(() => {
-    if (pipActiveForThis && local) {
+    if (pipActiveForThis && local && commentsSettled) {
       miniPlayer.updateComments(local.videoId, visibleComments);
     }
   });
@@ -390,6 +422,40 @@
                   <button type="button" class="pip-resume" onclick={() => miniPlayer.close()}>
                     ここで再生に戻す
                   </button>
+                </div>
+              </div>
+            </div>
+          {:else if pipActiveForOther}
+            <div class="pip-placeholder">
+              <div class="pip-thumb">
+                {#if lp.thumbnailUrl}
+                  <img src={lp.thumbnailUrl} alt="" />
+                {/if}
+                <div class="pip-overlay">
+                  <div class="pip-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="44" height="44">
+                      <path d="M3 5h18v14H3V5zm2 2v10h14V7H5zm7 4h6v4h-6v-4z" fill="currentColor" />
+                    </svg>
+                  </div>
+                  <div class="pip-text">別の動画がミニプレイヤーで再生中</div>
+                  <div class="pip-other-title">{pipOtherTitle}</div>
+                  <div class="pip-actions">
+                    <button
+                      type="button"
+                      class="pip-resume"
+                      onclick={() => miniPlayer.close()}
+                      title="PiP を閉じてこのページの動画を再生"
+                    >
+                      PiP を閉じてここで再生
+                    </button>
+                    <a
+                      class="pip-link"
+                      href={pipExpandHref}
+                      title="ミニプレイヤーで再生中の動画ページへ"
+                    >
+                      PiP の動画を開く
+                    </a>
+                  </div>
                 </div>
               </div>
             </div>
@@ -893,6 +959,35 @@
   }
   .pip-resume:hover {
     background: var(--theme-accent-hover);
+  }
+  .pip-other-title {
+    font-size: 12px;
+    color: var(--theme-surface-2);
+    opacity: 0.85;
+    max-width: 80%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: center;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+  }
+  .pip-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin-top: 4px;
+  }
+  .pip-link {
+    color: var(--theme-surface-2);
+    opacity: 0.9;
+    font-size: 12px;
+    text-decoration: underline;
+    padding: 4px 8px;
+  }
+  .pip-link:hover {
+    opacity: 1;
   }
   .tags {
     display: flex;

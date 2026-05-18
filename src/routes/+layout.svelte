@@ -255,6 +255,13 @@
 
   .content {
     overflow: auto;
+    /* 再生中に関連動画の遅延ロードでページ高さが伸び縮みすると、
+       scrollbar の出現/消失で .content の幅が ~15px 変動する。
+       width: 100% の <video> はそれに追従して縦も 16:9 で縮むため、
+       コンテンツ高 → scrollbar 状態 が振動して UI がガタつく原因に
+       なる。`stable` で常時 scrollbar 分の領域を確保し、scrollbar
+       のトグルで幅が変動しないようにする。 */
+    scrollbar-gutter: stable;
     padding: 24px;
     background: var(--theme-content-bg);
   }
