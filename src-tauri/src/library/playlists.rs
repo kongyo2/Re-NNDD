@@ -31,8 +31,7 @@ pub struct PlaylistItem {
     pub duration_sec: Option<i64>,
 }
 
-const PLAYLIST_SELECT: &str =
-    "SELECT p.id, p.name, p.parent_id, p.source, p.source_official_id, \
+const PLAYLIST_SELECT: &str = "SELECT p.id, p.name, p.parent_id, p.source, p.source_official_id, \
             p.imported_at, p.created_at, p.updated_at, \
             (SELECT COUNT(*) FROM playlist_items pi WHERE pi.playlist_id = p.id) AS item_count \
      FROM playlists p";

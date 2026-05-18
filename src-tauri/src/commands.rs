@@ -127,7 +127,9 @@ fn build_user_video_item(
             .or_else(|| v["thumbnail"]["listingUrl"].as_str())
             .or_else(|| v["thumbnailUrl"].as_str())
             .map(String::from),
-        length_seconds: v["duration"].as_i64().or_else(|| v["lengthSeconds"].as_i64()),
+        length_seconds: v["duration"]
+            .as_i64()
+            .or_else(|| v["lengthSeconds"].as_i64()),
         view_counter: v["count"]["view"]
             .as_i64()
             .or_else(|| v["viewCounter"].as_i64()),
@@ -173,7 +175,9 @@ async fn nv_get_json(
     if !status.is_success() {
         let preview: String = body.chars().take(200).collect();
         tracing::warn!(%url, %status, body = %preview, "{err_label}");
-        return Err(AppError::Other(format!("{err_label} ({status}): {preview}")));
+        return Err(AppError::Other(format!(
+            "{err_label} ({status}): {preview}"
+        )));
     }
 
     let json: serde_json::Value =
@@ -665,7 +669,13 @@ pub async fn fetch_user_videos(
         )
     };
 
-    let (json, body) = nv_get_json(&client, &url, store.cookie_header(), "ユーザー動画 API エラー").await?;
+    let (json, body) = nv_get_json(
+        &client,
+        &url,
+        store.cookie_header(),
+        "ユーザー動画 API エラー",
+    )
+    .await?;
 
     let preview: String = body.chars().take(500).collect();
     tracing::info!(%url, body = %preview, "user videos API response");
@@ -739,7 +749,14 @@ pub async fn fetch_series_videos(
     // Step 1: get series metadata from NV API. メタ取得は失敗しても致命的じゃ
     // ないので 4xx でも Null で先へ進む (Step2/3 が動画一覧を別経路で取りに行く)。
     let meta_url = format!("https://nvapi.nicovideo.jp/v1/series/{series_id}");
-    let meta_json = match nv_get_json(&client, &meta_url, store.cookie_header(), "シリーズメタ API エラー").await {
+    let meta_json = match nv_get_json(
+        &client,
+        &meta_url,
+        store.cookie_header(),
+        "シリーズメタ API エラー",
+    )
+    .await
+    {
         Ok((j, _)) => j,
         Err(_) => serde_json::Value::Null,
     };
@@ -1018,7 +1035,13 @@ pub async fn fetch_user_mylists(
 
     let client = build_nv_client()?;
     let url = format!("https://nvapi.nicovideo.jp/v1/users/{owner_id}/mylists?page=1&pageSize=50");
-    let (json, _body) = nv_get_json(&client, &url, store.cookie_header(), "マイリスト一覧 API エラー").await?;
+    let (json, _body) = nv_get_json(
+        &client,
+        &url,
+        store.cookie_header(),
+        "マイリスト一覧 API エラー",
+    )
+    .await?;
 
     let total_count = json["data"]["totalCount"].as_i64().unwrap_or(0);
 
@@ -1088,7 +1111,13 @@ pub async fn fetch_user_series_list(
 
     let client = build_nv_client()?;
     let url = format!("https://nvapi.nicovideo.jp/v1/users/{owner_id}/series?page=1&pageSize=50");
-    let (json, _body) = nv_get_json(&client, &url, store.cookie_header(), "シリーズ一覧 API エラー").await?;
+    let (json, _body) = nv_get_json(
+        &client,
+        &url,
+        store.cookie_header(),
+        "シリーズ一覧 API エラー",
+    )
+    .await?;
 
     let total_count = json["data"]["totalCount"].as_i64().unwrap_or(0);
 
@@ -1144,7 +1173,13 @@ pub async fn fetch_mylist_videos(
     let url = format!(
         "https://nvapi.nicovideo.jp/v2/mylists/{mylist_id}?pageSize={page_size}&page={page}"
     );
-    let (json, body) = nv_get_json(&client, &url, store.cookie_header(), "マイリスト動画 API エラー").await?;
+    let (json, body) = nv_get_json(
+        &client,
+        &url,
+        store.cookie_header(),
+        "マイリスト動画 API エラー",
+    )
+    .await?;
 
     let preview: String = body.chars().take(500).collect();
     tracing::info!(%url, body = %preview, "mylist videos API response");
@@ -1675,13 +1710,12 @@ pub async fn delete_library_video(
 /// 内蔵 HTTP サーバ経由のローカル動画 URL を返す。
 /// `<video src=...>` にこれを渡すと Range/206 が効いて WebKitGTK でも
 /// 後方シークが正しく動く（Blob URL では NG）。
-fn build_local_media_url(
-    video_id: &str,
-    file: &str,
-    server: &LocalServer,
-) -> Result<String> {
+fn build_local_media_url(video_id: &str, file: &str, server: &LocalServer) -> Result<String> {
     validate_video_id(video_id)?;
-    Ok(format!("http://127.0.0.1:{}/v/{}/{}", server.port, video_id, file))
+    Ok(format!(
+        "http://127.0.0.1:{}/v/{}/{}",
+        server.port, video_id, file
+    ))
 }
 
 #[tauri::command]

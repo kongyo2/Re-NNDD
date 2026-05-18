@@ -247,7 +247,9 @@ fn update_mvhd_next_track_id(mvhd_payload: &[u8], next_id: u32) -> Result<Vec<u8
 
 /// moof payload 内の各 traf -> tfhd の `track_ID` を書き換える。
 fn rewrite_track_id_in_moof(moof_payload: &[u8], new_id: u32) -> Result<Vec<u8>, ApiError> {
-    rewrite_child(moof_payload, b"traf", |p| rewrite_track_id_in_traf(p, new_id))
+    rewrite_child(moof_payload, b"traf", |p| {
+        rewrite_track_id_in_traf(p, new_id)
+    })
 }
 
 fn rewrite_track_id_in_traf(traf_payload: &[u8], new_id: u32) -> Result<Vec<u8>, ApiError> {
