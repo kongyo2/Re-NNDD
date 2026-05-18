@@ -152,11 +152,25 @@
     const match = uniqueLevels.find((u) => u.level.height === curHeight);
     return match ? match.index : -1;
   });
+
+  // 再生中、左側の時間表示 (currentTime) は秒ごとに桁が変わる。
+  // `.seek` は `max-content 1fr max-content` の grid なので、文字列の
+  // 自然幅が変わると col1 幅が変動し、その分 1fr のシークバーが左右に
+  // ガタつく。
+  // ・桁ごとの幅は親 `.seek` の `tabular-nums` で揃うはずだが、Linux/
+  //   WebKitGTK の system fallback (DejaVu Sans 等) は tabular feature
+  //   を持たないフォントが多く、実環境では完全には揃わない。
+  // ・また、9:59 → 10:00 のように文字数が増える場面では tabular でも
+  //   col1 幅が変動する。
+  // 両方を一括で潰すため、duration の文字数ぶんを ch 単位で min-width
+  // として両側 `.time` に予約する (currentTime ≤ duration なので、これ
+  // で col1 幅が再生中に縮みも伸びもしなくなる)。
+  let timeMinCh = $derived(formatDuration(duration).length);
 </script>
 
 <div class="bar">
   <div class="seek">
-    <span class="time">{formatDuration(currentTime)}</span>
+    <span class="time" style:min-width="{timeMinCh}ch">{formatDuration(currentTime)}</span>
     <div class="seek-track">
       <input
         type="range"
@@ -184,7 +198,7 @@
         ></span>
       {/if}
     </div>
-    <span class="time">{formatDuration(duration)}</span>
+    <span class="time" style:min-width="{timeMinCh}ch">{formatDuration(duration)}</span>
   </div>
 
   <div class="controls">
