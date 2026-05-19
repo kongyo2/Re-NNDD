@@ -2739,10 +2739,7 @@ pub async fn fetch_ranking_html(url: String) -> Result<String> {
         )));
     }
 
-    let html = resp
-        .text()
-        .await
-        .map_err(crate::error::ApiError::from)?;
+    let html = resp.text().await.map_err(crate::error::ApiError::from)?;
 
     tracing::debug!(%url, size = html.len(), "ranking HTML fetched");
     Ok(html)
