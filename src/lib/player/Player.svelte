@@ -1147,11 +1147,23 @@
     background: var(--theme-bg);
   }
 
+  .player.short {
+    max-width: calc(80vh * 9 / 16);
+    width: calc(80vh * 9 / 16);
+    margin: 0 auto;
+  }
+
+  @media (max-width: 480px) {
+    .player.short {
+      width: 100%;
+      max-width: 100%;
+    }
+  }
+
   .player.short :global(video) {
     aspect-ratio: 9 / 16;
     max-height: 80vh;
-    max-width: min(100%, calc(80vh * 9 / 16));
-    margin: 0 auto;
+    width: 100%;
   }
 
   .player.fullscreen :global(video) {

@@ -72,6 +72,7 @@ pub fn run() {
             commands::clear_session_cookie,
             commands::session_cookie_status,
             commands::login_password,
+            commands::login_mfa,
             commands::prepare_playback,
             commands::fetch_video_comments,
             commands::issue_hls_url,

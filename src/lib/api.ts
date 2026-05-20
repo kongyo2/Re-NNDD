@@ -126,6 +126,13 @@ export async function loginPassword(email: string, password: string): Promise<Lo
   return invoke<LoginResult>('login_password', { email, password });
 }
 
+export async function loginMfa(mfaSession: string, oneTimePassword: string): Promise<LoginResult> {
+  return invoke<LoginResult>('login_mfa', {
+    mfaSession,
+    oneTimePassword,
+  });
+}
+
 export type HlsResource = {
   dataBase64: string;
   contentType?: string;

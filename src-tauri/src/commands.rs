@@ -282,6 +282,29 @@ pub async fn login_password(
     }
 }
 
+#[tauri::command]
+pub async fn login_mfa(
+    mfa_session: String,
+    one_time_password: String,
+    store: State<'_, Arc<SessionStore>>,
+    library: State<'_, Arc<LibraryHandle>>,
+) -> Result<LoginResult> {
+    let outcome = crate::api::auth::login_mfa(&mfa_session, &one_time_password)
+        .await
+        .map_err(AppError::from)?;
+    match outcome {
+        LoginOutcome::Success { user_session } => {
+            let conn = library.lock().await;
+            store.set_with_conn(user_session, &conn);
+            Ok(LoginResult::Success)
+        }
+        LoginOutcome::Mfa { .. } => Ok(LoginResult::Mfa {
+            mfa_session: Some(mfa_session),
+        }),
+        LoginOutcome::InvalidCredentials => Ok(LoginResult::InvalidCredentials),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PickedQuality {

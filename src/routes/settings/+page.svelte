@@ -3,6 +3,7 @@
   import {
     clearSessionCookie,
     getAppInfo,
+    loginMfa,
     loginPassword,
     saveSessionCookie,
     sessionCookieStatus,
@@ -27,6 +28,10 @@
   let cookie = $state('');
   let pending = $state(false);
   let message = $state<{ kind: 'ok' | 'warn' | 'error'; text: string } | null>(null);
+
+  let mfaRequired = $state(false);
+  let mfaSession = $state<string | null>(null);
+  let otpCode = $state('');
 
   // ========= アプリ情報 =========
   let appInfo = $state<AppInfo | null>(null);
@@ -73,11 +78,51 @@
     if (!email || !password) return;
     pending = true;
     message = null;
+    mfaRequired = false;
     try {
       const result = await loginPassword(email, password);
-      message = summarizeLogin(result);
-      if (result.kind === 'success') password = '';
-      await refresh();
+      if (result.kind === 'mfa') {
+        mfaRequired = true;
+        mfaSession = result.mfaSession ?? null;
+        if (result.mfaSession) {
+          message = { kind: 'warn', text: '二段階認証コードを入力してください。' };
+        } else {
+          message = {
+            kind: 'warn',
+            text: '二段階認証が必要です。ブラウザでログインして user_session を貼り付けてください。',
+          };
+        }
+      } else {
+        message = summarizeLogin(result);
+        if (result.kind === 'success') password = '';
+        await refresh();
+      }
+    } catch (e) {
+      message = { kind: 'error', text: String(e) };
+    } finally {
+      pending = false;
+    }
+  }
+
+  async function handleMfaSubmit(event: Event) {
+    event.preventDefault();
+    if (!otpCode.trim() || !mfaSession) return;
+    pending = true;
+    message = null;
+    try {
+      const result = await loginMfa(mfaSession, otpCode.trim());
+      if (result.kind === 'mfa') {
+        message = { kind: 'error', text: '認証コードが正しくありません。再試行してください。' };
+      } else {
+        message = summarizeLogin(result);
+        if (result.kind === 'success') {
+          password = '';
+          mfaRequired = false;
+          mfaSession = null;
+          otpCode = '';
+        }
+        await refresh();
+      }
     } catch (e) {
       message = { kind: 'error', text: String(e) };
     } finally {
@@ -300,6 +345,33 @@
         </button>
       </div>
     </form>
+
+    {#if mfaRequired}
+      {#if mfaSession}
+        <form onsubmit={handleMfaSubmit} class="mfa-form">
+          <label>
+            二段階認証コード
+            <input
+              type="text"
+              inputmode="numeric"
+              maxlength="6"
+              bind:value={otpCode}
+              autocomplete="one-time-code"
+              placeholder="000000"
+            />
+          </label>
+          <div class="actions">
+            <button type="submit" class="primary" disabled={pending || otpCode.length < 6}>
+              {pending ? '確認中…' : '認証'}
+            </button>
+          </div>
+        </form>
+      {:else}
+        <p class="hint" style="padding:12px;border:1px solid var(--theme-border-strong);border-radius:8px">
+          MFA セッションを取得できませんでした。下の「Cookie 直入れ」から <code>user_session</code> を貼り付けてください。
+        </p>
+      {/if}
+    {/if}
 
     <details>
       <summary>2FA / SSO の人は user_session Cookie 直入れ</summary>
@@ -545,6 +617,16 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+  .mfa-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid var(--theme-border-strong);
+    border-radius: 8px;
+    background: var(--theme-surface-2);
+    margin-bottom: 8px;
   }
   label {
     display: flex;

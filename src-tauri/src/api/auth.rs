@@ -191,6 +191,52 @@ pub async fn login_with_password(email: &str, password: &str) -> Result<LoginOut
     Ok(LoginOutcome::InvalidCredentials)
 }
 
+/// Complete MFA login with one-time password and mfa_session cookie.
+pub async fn login_mfa(
+    mfa_session: &str,
+    one_time_password: &str,
+) -> Result<LoginOutcome, ApiError> {
+    if mfa_session.is_empty() || one_time_password.is_empty() {
+        return Err(ApiError::InvalidQuery(
+            "mfa_session and one_time_password must be provided".into(),
+        ));
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent(BROWSER_UA)
+        .redirect(Policy::none())
+        .build()?;
+
+    let form = [("oneTimePassword", one_time_password)];
+    let response = client
+        .post(LOGIN_URL)
+        .header("Cookie", format!("mfa_session={mfa_session}"))
+        .form(&form)
+        .send()
+        .await?;
+
+    let mut user_session: Option<String> = None;
+    for header_value in response.headers().get_all(SET_COOKIE) {
+        let raw = match header_value.to_str() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Some(rest) = raw.strip_prefix("user_session=") {
+            let value = rest.split(';').next().unwrap_or("");
+            if !value.is_empty() && value != "deleted" {
+                user_session = Some(value.to_string());
+            }
+        }
+    }
+
+    if let Some(token) = user_session {
+        return Ok(LoginOutcome::Success {
+            user_session: token,
+        });
+    }
+    Ok(LoginOutcome::InvalidCredentials)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
