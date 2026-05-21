@@ -49,6 +49,9 @@
     /** 無音ロードが完了し音声を引き継げる状態になった通知。`initialMuted=true`
      *  の時のみ発火し、1 度だけ呼ばれる。 */
     onReadyForAudio?: () => void;
+    /** 動画が自然終了した通知。`loop` 中は発火しない (内部でループ巻き戻しのみ行う)。
+     *  オートプレイキューの「次の動画へ進む」フックを親が刺すのに使う。 */
+    onEnded?: () => void;
   };
 
   let {
@@ -68,6 +71,7 @@
     onLoopChange,
     initialMuted = false,
     onReadyForAudio,
+    onEnded: onEndedExternal,
     videoTitle = '',
     videoId = '',
   }: Props = $props();
@@ -763,6 +767,7 @@
     } else {
       paused = true;
       showControls();
+      onEndedExternal?.();
     }
   }
 

@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { beforeNavigate } from '$app/navigation';
+  import { beforeNavigate, goto } from '$app/navigation';
   import { page } from '$app/state';
   import Player from '$lib/player/Player.svelte';
   import CommentList from '$lib/player/CommentList.svelte';
+  import QueueBanner from '$lib/QueueBanner.svelte';
   import { fetchVideoComments, issueHlsUrl, preparePlayback, type SearchHit } from '$lib/api';
   import { quickDownload } from '$lib/quickDownload';
   import { formatDate, formatDuration, formatNumber, videoUrl } from '$lib/format';
@@ -17,6 +18,12 @@
   import { getBool, getStr, loadSettings } from '$lib/stores/settings.svelte';
   import { sanitizeDescriptionHtml } from '$lib/sanitize';
   import { miniPlayer } from '$lib/player/miniPlayerStore.svelte';
+  import {
+    advanceQueue,
+    getQueue,
+    itemHref,
+    setQueueIndexByVideoId,
+  } from '$lib/stores/playbackQueue';
 
   // この route は **オンライン視聴専用**。ローカル再生は /library/[id] で行う。
   // 別ルートに分けることで、ネット接続が要らないときに偶発的に niconico を
@@ -95,6 +102,32 @@
     } else if (from === 'ranking') {
       backHref = '/ranking';
       backLabel = '← ランキングに戻る';
+    } else if (from === 'queue') {
+      const q = getQueue();
+      if (q) {
+        if (q.context === 'series') {
+          backHref = `/series/${q.contextId}`;
+          backLabel = `← シリーズ「${q.label}」に戻る`;
+        } else if (q.context === 'mylist') {
+          backHref = `/playlists?mylistId=${encodeURIComponent(q.contextId)}`;
+          backLabel = `← マイリスト「${q.label}」に戻る`;
+        } else if (q.context === 'smart') {
+          backHref = `/playlists/smart/${q.contextId}`;
+          backLabel = `← スマートプレイリスト「${q.label}」に戻る`;
+        } else if (q.context === 'library') {
+          backHref = '/library';
+          backLabel = '← ライブラリに戻る';
+        } else if (q.context === 'user') {
+          backHref = `/user/${q.contextId}`;
+          backLabel = `← 「${q.label}」の投稿動画に戻る`;
+        } else {
+          backHref = '/playlists';
+          backLabel = '← プレイリストに戻る';
+        }
+      } else {
+        backHref = '/search';
+        backLabel = '← 検索に戻る';
+      }
     } else {
       const prev = loadSearchState();
       if (prev?.lastQuery) {
@@ -194,8 +227,26 @@
     void load(videoId);
   });
 
+  // 動画 ID が変わったらキューの index を合わせる (前後遷移ボタンの判定用)。
+  // 直接 URL を打って入ってきた場合もここで同期する。
+  $effect(() => {
+    if (videoId) setQueueIndexByVideoId(videoId);
+  });
+
   function handleSeek(t: number) {
     playerRef?.seek(t);
+  }
+
+  function handleEnded() {
+    if (!getBool('playback.autoplay_queue')) return;
+    const q = getQueue();
+    if (!q) return;
+    const idx = q.items.findIndex((it) => it.videoId === (payload?.videoId ?? videoId));
+    if (idx < 0) return;
+    const nxt = q.items[idx + 1];
+    if (!nxt) return;
+    advanceQueue();
+    void goto(itemHref(nxt));
   }
 
   function getResumePosition(id: string): number {
@@ -422,6 +473,8 @@
     <div class="dl-msg {dlMsg.kind}">{dlMsg.text}</div>
   {/if}
 
+  <QueueBanner videoId={payload?.video.id ?? videoId} />
+
   {#if pending}
     <div class="player-row">
       <div class="player-col">
@@ -536,6 +589,7 @@
               short={p.isShort}
               refreshHlsUrl={() => issueHlsUrl(p.videoId)}
               onTime={handleTimeUpdate}
+              onEnded={handleEnded}
               resumePosition={getResumePosition(p.videoId)}
               {loop}
               onLoopChange={(v) => (loop = v)}

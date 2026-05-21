@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { beforeNavigate } from '$app/navigation';
+  import { beforeNavigate, goto } from '$app/navigation';
   import { page } from '$app/state';
   import Player from '$lib/player/Player.svelte';
   import CommentList from '$lib/player/CommentList.svelte';
+  import QueueBanner from '$lib/QueueBanner.svelte';
   import {
     deleteLibraryVideo,
     dtoToPlayerComment,
@@ -20,6 +21,12 @@
   import { getBool, getStr, loadSettings } from '$lib/stores/settings.svelte';
   import { sanitizeDescriptionHtml } from '$lib/sanitize';
   import { miniPlayer } from '$lib/player/miniPlayerStore.svelte';
+  import {
+    advanceQueue,
+    getQueue,
+    itemHref,
+    setQueueIndexByVideoId,
+  } from '$lib/stores/playbackQueue';
 
   let local = $state<LocalPlaybackPayload | null>(null);
   let localSrc = $state<string | null>(null);
@@ -63,6 +70,26 @@
     if (from === 'history') {
       backHref = '/history';
       backLabel = '← 履歴に戻る';
+    } else if (from === 'queue') {
+      const q = getQueue();
+      if (q) {
+        if (q.context === 'mylist') {
+          backHref = `/playlists?mylistId=${encodeURIComponent(q.contextId)}`;
+          backLabel = `← マイリスト「${q.label}」に戻る`;
+        } else if (q.context === 'smart') {
+          backHref = `/playlists/smart/${q.contextId}`;
+          backLabel = `← スマートプレイリスト「${q.label}」に戻る`;
+        } else if (q.context === 'series') {
+          backHref = `/series/${q.contextId}`;
+          backLabel = `← シリーズ「${q.label}」に戻る`;
+        } else {
+          backHref = '/library';
+          backLabel = '← ライブラリに戻る';
+        }
+      } else {
+        backHref = '/library';
+        backLabel = '← ライブラリに戻る';
+      }
     } else {
       backHref = '/library';
       backLabel = '← ライブラリに戻る';
@@ -130,8 +157,24 @@
     void load(videoId);
   });
 
+  $effect(() => {
+    if (videoId) setQueueIndexByVideoId(videoId);
+  });
+
   function handleSeek(t: number) {
     playerRef?.seek(t);
+  }
+
+  function handleEnded() {
+    if (!getBool('playback.autoplay_queue')) return;
+    const q = getQueue();
+    if (!q) return;
+    const idx = q.items.findIndex((it) => it.videoId === (local?.videoId ?? videoId));
+    if (idx < 0) return;
+    const nxt = q.items[idx + 1];
+    if (!nxt) return;
+    advanceQueue();
+    void goto(itemHref(nxt));
   }
 
   function getResumePosition(id: string): number {
@@ -347,6 +390,8 @@
     {/if}
   </div>
 
+  <QueueBanner videoId={local?.videoId ?? videoId} />
+
   {#if remuxMessage}
     <div class="info">{remuxMessage}</div>
   {/if}
@@ -457,6 +502,7 @@
               videoTitle={lp.title}
               videoId={lp.videoId}
               onTime={handleTimeUpdate}
+              onEnded={handleEnded}
               resumePosition={getResumePosition(lp.videoId)}
               {loop}
               onLoopChange={(v) => (loop = v)}
