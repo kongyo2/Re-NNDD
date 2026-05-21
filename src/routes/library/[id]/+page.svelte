@@ -68,6 +68,17 @@
     return !(fromQueue && hasNextInQueue(id));
   }
 
+  // 「ユーザが今キュー再生中である」確証がある時だけ forceAutoplay。
+  // bookmark / shared URL で `?from=queue` 残骸付きでも、キューに乗って
+  // いない動画では `playback.autoplay=false` 設定を尊重する (codex
+  // r3283322762)。
+  function shouldForceAutoplay(id: string): boolean {
+    if (page.url.searchParams.get('from') !== 'queue') return false;
+    const q = getQueue();
+    if (!q) return false;
+    return q.items[q.index]?.videoId === id;
+  }
+
   // キュー停止/進行で loop の既定値が変わるケースに追従する (codex review)。
   const unsubQueueLoop = subscribeQueue(() => {
     if (loopUserSet) return;
@@ -302,6 +313,7 @@
       },
       title: snapTitle,
       comments: visibleComments,
+      rawComments: comments,
       resumePosition: t,
       expandHref: snapHref,
       loop,
@@ -344,7 +356,7 @@
   // このガードを通って mini へ伝播する。
   $effect(() => {
     if (pipActiveForThis && local && commentsSettled) {
-      miniPlayer.updateComments(local.videoId, visibleComments);
+      miniPlayer.updateComments(local.videoId, visibleComments, comments);
     }
   });
 
@@ -532,7 +544,7 @@
               }}
               onTogglePip={togglePip}
               pipActive={false}
-              forceAutoplay={page.url.searchParams.get('from') === 'queue'}
+              forceAutoplay={shouldForceAutoplay(lp.videoId)}
             />
           {/if}
           {#if ngFilteredCount > 0}

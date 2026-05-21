@@ -137,11 +137,17 @@
   // 各 await の後、ユーザがキューを止めたり PiP を閉じたりしていないか
   // 再確認する。古い fetch が遅延到着して PiP に意図しない動画を流し込む
   // のを防ぐ (codex review)。`true` を返したら abort してよい。
+  //
+  // index も比較するのが重要 (codex r3283322738): ユーザが QueueBanner の
+  // Next/Prev で手動進行した場合、items[idx+1] は変わらなくても cursor が
+  // 動いている。それを見落とすと旧 handleEnded が advanceQueue() を再度
+  // 走らせて persisted index が二重前進し、queue item を飛ばす。
   function staleSnapshot(currentId: string, expectedNxtId: string, idx: number): boolean {
     if (!miniPlayer.active) return true;
     if (miniPlayer.source?.videoId !== currentId) return true;
     const q2 = getQueue();
     if (!q2) return true;
+    if (q2.index !== idx) return true;
     if (q2.items[idx + 1]?.videoId !== expectedNxtId) return true;
     return false;
   }
@@ -183,6 +189,8 @@
           }
         }
         // ページ側 visibleComments と同じく NG ルールを適用してから渡す。
+        // raw も保存しておき、後で NG ルールが緩和された時に再フィルタで
+        // 復活できるようにする (codex r3283322745)。
         const filtered = filterComments(ngRules, comments);
         miniPlayer.replaceSource({
           source: {
@@ -194,6 +202,7 @@
           title,
           expandHref,
           comments: filtered,
+          rawComments: comments,
           resumePosition,
           loop: nextItemLoop(nxt.videoId),
         });
@@ -231,6 +240,7 @@
           title,
           expandHref,
           comments: filtered,
+          rawComments: comments,
           resumePosition,
           loop: nextItemLoop(nxt.videoId),
         });
@@ -252,14 +262,29 @@
     }
   }
 
-  // PiP 内で NG ルールが変化したら現在表示中の comments も再フィルタする。
-  // (キュー進行中の動画は既に NG 適用済みだが、追加変更を反映するため)
+  // PiP 内で NG ルールが変化したら現在表示中の comments を再フィルタする。
+  // 重要: 既にフィルタ済みの `miniPlayer.comments` ではなく、`rawComments`
+  // を元に再計算する (codex r3283322745)。そうしないとルールが緩和された
+  // 時に隠していた comment を復活させられない。
+  //
+  // 比較は要素一致まで見る (codex r3283322753)。長さだけだと、別 comment が
+  // 入れ替わっただけの NG 変更を取りこぼす。
   $effect(() => {
     if (!miniPlayer.active) return;
     if (!miniPlayer.replacedFromQueue) return;
     void ngRules; // subscribe
-    const reFiltered = filterComments(ngRules, miniPlayer.comments);
-    if (reFiltered.length !== miniPlayer.comments.length) {
+    const reFiltered = filterComments(ngRules, miniPlayer.rawComments);
+    const current = miniPlayer.comments;
+    let same = reFiltered.length === current.length;
+    if (same) {
+      for (let i = 0; i < reFiltered.length; i++) {
+        if (reFiltered[i].id !== current[i].id) {
+          same = false;
+          break;
+        }
+      }
+    }
+    if (!same) {
       const id = miniPlayer.source?.videoId;
       if (id) miniPlayer.updateComments(id, reFiltered);
     }

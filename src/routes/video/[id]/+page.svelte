@@ -78,6 +78,17 @@
     return !(fromQueue && hasNextInQueue(id));
   }
 
+  // 「ユーザが今キュー再生中である」と確証できる時だけ forceAutoplay を返す。
+  // `?from=queue` だけでは bookmark / shared URL でも true になってしまい
+  // `playback.autoplay=false` 設定をすり抜けてしまう (codex r3283322762)。
+  // 永続キューが存在し、その index が今のページに一致する時のみ強制。
+  function shouldForceAutoplay(id: string): boolean {
+    if (page.url.searchParams.get('from') !== 'queue') return false;
+    const q = getQueue();
+    if (!q) return false;
+    return q.items[q.index]?.videoId === id;
+  }
+
   // キューが ■ 停止 や advance で変化した時、ユーザが手動で loop を
   // 弄っていなければ既定値を再評価する。これで「always_loop=true 設定の人が
   // ページ滞在中にキューを止める → ループが死ぬ」を防ぐ (codex review)。
@@ -384,6 +395,7 @@
       },
       title: snapTitle,
       comments: visibleComments,
+      rawComments: comments,
       resumePosition: t,
       expandHref: snapHref,
       loop,
@@ -426,7 +438,7 @@
   // PiP 中はミニ側で取得済みコメの方が新しい可能性があるので、ミニ側にも反映
   $effect(() => {
     if (pipActiveForThis && payload) {
-      miniPlayer.updateComments(payload.videoId, visibleComments);
+      miniPlayer.updateComments(payload.videoId, visibleComments, comments);
     }
   });
 
@@ -625,7 +637,7 @@
               }}
               onTogglePip={togglePip}
               pipActive={false}
-              forceAutoplay={page.url.searchParams.get('from') === 'queue'}
+              forceAutoplay={shouldForceAutoplay(p.video.id)}
             />
           {/if}
           {#if ngFilteredCount > 0}
