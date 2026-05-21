@@ -32,7 +32,7 @@ describe('playbackQueue', () => {
   });
 
   test('setQueue persists and is readable', () => {
-    setQueue('series', 'ser1', 'My Series', makeItems(3));
+    setQueue('series', 'srs1', 'My Series', makeItems(3));
     const q = getQueue();
     expect(q).not.toBeNull();
     expect(q?.context).toBe('series');
