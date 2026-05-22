@@ -38,6 +38,9 @@ pub struct LibraryQuery {
     /// Resolution filter (exact match, e.g. "1280x720").
     pub resolution: Option<String>,
 
+    /// ショート（縦長）動画に限定するフィルタ。None = 絞り込みなし。
+    pub is_short: Option<bool>,
+
     /// Sort column. Defaults to `"downloaded_at"`.
     pub sort_by: Option<String>,
 
@@ -62,6 +65,7 @@ const ALLOWED_SORT: &[&str] = &[
     "last_played_at",
     "mylist_count",
     "comment_count",
+    "is_short",
     "random",
 ];
 
@@ -114,6 +118,7 @@ pub struct LibraryVideoRow {
     pub tags: Vec<String>,
     #[serde(default)]
     pub local_thumbnail_path: Option<String>,
+    pub is_short: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +261,12 @@ pub fn query_videos(conn: &Connection, q: &LibraryQuery) -> Result<QueryResult, 
         sql_where.push(format!("v.resolution = ?{p}"));
     }
 
+    if let Some(is_short) = q.is_short {
+        let p = params.len() + 1;
+        params.push(Box::new(is_short as i64));
+        sql_where.push(format!("v.is_short = ?{p}"));
+    }
+
     let where_clause = format!("WHERE {}", sql_where.join(" AND "));
 
     // Count query.
@@ -280,7 +291,7 @@ pub fn query_videos(conn: &Connection, q: &LibraryQuery) -> Result<QueryResult, 
         "SELECT v.id, v.title, v.description, v.uploader_id, v.uploader_name, \
                 v.uploader_type, v.category, v.duration_sec, v.posted_at, v.view_count, \
                 v.comment_count, v.mylist_count, v.thumbnail_url, v.video_path, v.resolution, \
-                v.downloaded_at, v.play_count, v.last_played_at \
+                v.downloaded_at, v.play_count, v.last_played_at, v.is_short \
          FROM videos v \
          {where_clause} \
          {order_clause} \
@@ -315,6 +326,7 @@ pub fn query_videos(conn: &Connection, q: &LibraryQuery) -> Result<QueryResult, 
                 last_played_at: row.get(17)?,
                 tags: Vec::new(),
                 local_thumbnail_path: None,
+                is_short: row.get::<_, i64>(18)? != 0,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -618,6 +630,7 @@ mod tests {
             video_path: Some(format!("videos/{id}/video.mp4")),
             raw_meta_json: None,
             resolution: resolution.map(String::from),
+            is_short: false,
         }
     }
 

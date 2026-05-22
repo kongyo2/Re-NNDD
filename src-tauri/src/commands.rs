@@ -1644,9 +1644,14 @@ async fn run_one_download(
             video_path: Some(format!("videos/{video_id}/video.mp4")),
             raw_meta_json,
             resolution: resolution.clone(),
+            is_short: p.video.content_type.as_deref() == Some("short"),
         }
     } else {
         // watch page が取れなかったケース（fallback）。yt-dlp info.json から組む。
+        let is_short_fallback = match (info["width"].as_i64(), info["height"].as_i64()) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => h > w,
+            _ => false,
+        };
         VideoRecord {
             id: video_id.to_string(),
             title: info["title"].as_str().unwrap_or(video_id).to_string(),
@@ -1681,6 +1686,7 @@ async fn run_one_download(
             video_path: Some(format!("videos/{video_id}/video.mp4")),
             raw_meta_json: serde_json::to_string(info).ok(),
             resolution: resolution.clone(),
+            is_short: is_short_fallback,
         }
     };
     let tag_records: Vec<TagRecord> = if let Some(p) = page.as_ref() {
@@ -2198,18 +2204,6 @@ pub struct LibraryTag {
     pub is_locked: bool,
 }
 
-/// resolution の "{w}x{h}" 形式から縦長（高さ > 幅）ならショートと判定。
-fn is_short_from_resolution(resolution: Option<&str>) -> bool {
-    if let Some(res) = resolution {
-        if let Some((w_str, h_str)) = res.split_once('x') {
-            let w: i64 = w_str.parse().unwrap_or(0);
-            let h: i64 = h_str.parse().unwrap_or(0);
-            return h > w && w > 0;
-        }
-    }
-    false
-}
-
 /// ローカルに DL 済みの動画がある場合のみ Some を返す。
 /// 無ければ呼び出し側は `prepare_playback` (HLS) にフォールバックする。
 /// `snapshot_id` を指定するとそのスナップショットのコメントを返す。
@@ -2233,7 +2227,7 @@ pub async fn prepare_local_playback(
     let video_row = conn
         .query_row(
             "SELECT id, title, description, duration_sec, uploader_id, uploader_name, uploader_type, \
-                    view_count, comment_count, mylist_count, posted_at, thumbnail_url, video_path, resolution \
+                    view_count, comment_count, mylist_count, posted_at, thumbnail_url, video_path, is_short \
              FROM videos WHERE id = ?1",
             rusqlite::params![video_id],
             |row| {
@@ -2251,7 +2245,7 @@ pub async fn prepare_local_playback(
                     row.get::<_, Option<i64>>(10)?,
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, i64>(13)?,
                 ))
             },
         )
@@ -2263,7 +2257,7 @@ pub async fn prepare_local_playback(
         return Ok(None);
     };
 
-    let is_short = is_short_from_resolution(row.13.as_deref());
+    let is_short = row.13 != 0;
 
     let abs_video = app_data_dir.join(&video_rel_path);
     if !abs_video.exists() {
@@ -2819,6 +2813,7 @@ pub struct PlayHistoryItemDto {
     pub title: Option<String>,
     pub thumbnail_url: Option<String>,
     pub duration_sec: Option<i64>,
+    pub is_short: bool,
 }
 
 impl From<crate::library::history::PlayHistoryItem> for PlayHistoryItemDto {
@@ -2832,6 +2827,7 @@ impl From<crate::library::history::PlayHistoryItem> for PlayHistoryItemDto {
             title: i.title,
             thumbnail_url: i.thumbnail_url,
             duration_sec: i.duration_sec,
+            is_short: i.is_short,
         }
     }
 }
@@ -2858,12 +2854,17 @@ pub async fn record_playback(
 pub async fn list_play_history(
     offset: Option<u32>,
     limit: Option<u32>,
+    is_short: Option<bool>,
     library: State<'_, Arc<LibraryHandle>>,
 ) -> Result<Vec<PlayHistoryItemDto>> {
     let conn = library.lock().await;
-    let items =
-        crate::library::history::list_play_history(&conn, offset.unwrap_or(0), limit.unwrap_or(50))
-            .map_err(AppError::from)?;
+    let items = crate::library::history::list_play_history(
+        &conn,
+        offset.unwrap_or(0),
+        limit.unwrap_or(50),
+        is_short,
+    )
+    .map_err(AppError::from)?;
     Ok(items.into_iter().map(Into::into).collect())
 }
 

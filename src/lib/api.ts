@@ -408,6 +408,7 @@ export type LibraryQueryParams = {
   minDuration?: number;
   maxDuration?: number;
   resolution?: string;
+  isShort?: boolean;
   sortBy?: string;
   sortOrder?: 'asc' | 'desc';
   offset?: number;
@@ -435,6 +436,7 @@ export type LibraryVideoRow = {
   lastPlayedAt: number | null;
   tags: string[];
   localThumbnailPath: string | null;
+  isShort: boolean;
 };
 
 export type QueryResult = {
@@ -690,6 +692,7 @@ export type PlayHistoryItem = {
   title: string | null;
   thumbnailUrl: string | null;
   durationSec: number | null;
+  isShort: boolean;
 };
 
 export async function recordPlayback(
@@ -704,10 +707,15 @@ export async function recordPlayback(
   });
 }
 
-export async function listPlayHistory(offset?: number, limit?: number): Promise<PlayHistoryItem[]> {
+export async function listPlayHistory(
+  offset?: number,
+  limit?: number,
+  isShort?: boolean | null,
+): Promise<PlayHistoryItem[]> {
   return invoke<PlayHistoryItem[]>('list_play_history', {
     offset: offset ?? 0,
     limit: limit ?? 50,
+    isShort: isShort ?? null,
   });
 }
 

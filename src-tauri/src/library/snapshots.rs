@@ -200,6 +200,7 @@ mod tests {
             video_path: Some("videos/sm9/video.mp4".into()),
             raw_meta_json: None,
             resolution: None,
+            is_short: false,
         };
 
         ingest_downloaded(

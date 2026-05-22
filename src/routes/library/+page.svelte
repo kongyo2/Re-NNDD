@@ -18,11 +18,16 @@
   let error = $state<string | null>(null);
   let deleting = $state<string | null>(null);
   let searchQuery = $state('');
+  let filterShort = $state(false);
 
   async function refresh() {
     try {
-      if (searchQuery.trim()) {
-        const result = await queryLibraryVideos({ q: searchQuery.trim() });
+      const q = searchQuery.trim();
+      if (q || filterShort) {
+        const result = await queryLibraryVideos({
+          q: q || undefined,
+          isShort: filterShort || undefined,
+        });
         items = result.items.map((r) => ({
           id: r.id,
           title: r.title,
@@ -152,6 +157,10 @@
         bind:value={searchQuery}
         oninput={onSearchInput}
       />
+      <label class="short-toggle">
+        <input type="checkbox" bind:checked={filterShort} onchange={refresh} />
+        <span>ショート</span>
+      </label>
       <button type="button" class="ghost" onclick={refresh}>更新</button>
       <button
         type="button"
@@ -294,6 +303,18 @@
   }
   .search-box:focus {
     border-color: var(--theme-accent-border);
+  }
+  .short-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--theme-text-soft);
+    cursor: pointer;
+    user-select: none;
+  }
+  .short-toggle input {
+    accent-color: var(--theme-accent);
   }
   .info {
     background: var(--theme-accent-bg);

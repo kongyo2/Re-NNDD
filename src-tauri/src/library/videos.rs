@@ -29,6 +29,9 @@ pub struct VideoRecord {
     pub raw_meta_json: Option<String>,
     /// "1280x720" 形式。yt-dlp info の width/height から作る。Optional。
     pub resolution: Option<String>,
+    /// 縦長ショート動画かどうか。ダウンロード時に watch page の contentType から取得。
+    #[serde(default)]
+    pub is_short: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +108,7 @@ pub fn get_video(conn: &Connection, video_id: &str) -> Result<Option<VideoRecord
         .query_row(
             "SELECT id, title, description, uploader_id, uploader_name, uploader_type, \
                     category, duration_sec, posted_at, view_count, comment_count, mylist_count, \
-                    thumbnail_url, video_path, raw_meta_json, resolution \
+                    thumbnail_url, video_path, raw_meta_json, resolution, is_short \
              FROM videos WHERE id = ?1",
             params![video_id],
             |row| {
@@ -126,6 +129,7 @@ pub fn get_video(conn: &Connection, video_id: &str) -> Result<Option<VideoRecord
                     video_path: row.get(13)?,
                     raw_meta_json: row.get(14)?,
                     resolution: row.get(15)?,
+                    is_short: row.get::<_, i64>(16)? != 0,
                 })
             },
         )
@@ -142,9 +146,9 @@ fn upsert_video_with_tx(
         "INSERT INTO videos \
             (id, title, description, uploader_id, uploader_name, uploader_type, category, \
              duration_sec, posted_at, view_count, comment_count, mylist_count, thumbnail_url, \
-             status, status_checked_at, downloaded_at, video_path, raw_meta_json, resolution) \
+             status, status_checked_at, downloaded_at, video_path, raw_meta_json, resolution, is_short) \
          VALUES \
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'active', ?14, ?14, ?15, ?16, ?17) \
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'active', ?14, ?14, ?15, ?16, ?17, ?18) \
          ON CONFLICT(id) DO UPDATE SET \
             title = excluded.title, \
             description = excluded.description, \
@@ -163,7 +167,8 @@ fn upsert_video_with_tx(
             downloaded_at = COALESCE(videos.downloaded_at, excluded.downloaded_at), \
             video_path = excluded.video_path, \
             raw_meta_json = COALESCE(excluded.raw_meta_json, videos.raw_meta_json), \
-            resolution = COALESCE(excluded.resolution, videos.resolution)",
+            resolution = COALESCE(excluded.resolution, videos.resolution), \
+            is_short = excluded.is_short",
         params![
             v.id,
             v.title,
@@ -182,6 +187,7 @@ fn upsert_video_with_tx(
             v.video_path,
             v.raw_meta_json,
             v.resolution,
+            v.is_short as i64,
         ],
     )?;
     Ok(())
@@ -277,6 +283,7 @@ mod tests {
             video_path: Some("videos/sm9/video.mp4".into()),
             raw_meta_json: None,
             resolution: Some("1280x720".into()),
+            is_short: false,
         }
     }
 

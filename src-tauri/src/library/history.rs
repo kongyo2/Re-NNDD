@@ -15,6 +15,7 @@ pub struct PlayHistoryItem {
     pub title: Option<String>,
     pub thumbnail_url: Option<String>,
     pub duration_sec: Option<i64>,
+    pub is_short: bool,
 }
 
 pub fn record_playback(
@@ -46,6 +47,7 @@ pub fn record_playback(
         title: None,
         thumbnail_url: None,
         duration_sec: None,
+        is_short: false,
     })
 }
 
@@ -53,31 +55,40 @@ pub fn list_play_history(
     conn: &Connection,
     offset: u32,
     limit: u32,
+    is_short: Option<bool>,
 ) -> Result<Vec<PlayHistoryItem>, LibraryError> {
     let limit = limit.min(200);
-    let mut stmt = conn.prepare(
+    let query = format!(
         "SELECT h.id, h.video_id, h.played_at, h.duration_played_sec, h.position_at_close_sec, \
-                v.title, v.thumbnail_url, v.duration_sec \
+                v.title, v.thumbnail_url, v.duration_sec, COALESCE(v.is_short, 0) \
          FROM play_history h \
          LEFT JOIN videos v ON v.id = h.video_id \
+         {} \
          ORDER BY h.played_at DESC \
          LIMIT ?1 OFFSET ?2",
-    )?;
-    let rows = stmt
-        .query_map(params![limit, offset], |row| {
-            Ok(PlayHistoryItem {
-                id: row.get(0)?,
-                video_id: row.get(1)?,
-                played_at: row.get(2)?,
-                duration_played_sec: row.get(3)?,
-                position_at_close_sec: row.get(4)?,
-                title: row.get(5)?,
-                thumbnail_url: row.get(6)?,
-                duration_sec: row.get(7)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
+        if is_short.is_some() {
+            "WHERE v.is_short = ?3"
+        } else {
+            "WHERE 1=1"
+        },
+    );
+    let flag = is_short.unwrap_or(false) as i64;
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map(params![limit, offset, flag], |row| {
+        Ok(PlayHistoryItem {
+            id: row.get(0)?,
+            video_id: row.get(1)?,
+            played_at: row.get(2)?,
+            duration_played_sec: row.get(3)?,
+            position_at_close_sec: row.get(4)?,
+            title: row.get(5)?,
+            thumbnail_url: row.get(6)?,
+            duration_sec: row.get(7)?,
+            is_short: row.get::<_, i64>(8)? != 0,
+        })
+    })?;
+    let items = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(items)
 }
 
 pub fn clear_play_history(conn: &Connection) -> Result<usize, LibraryError> {

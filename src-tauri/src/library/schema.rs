@@ -26,6 +26,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "video_resolution",
         sql: include_str!("schema/m002_video_resolution.sql"),
     },
+    Migration {
+        version: 3,
+        name: "is_short",
+        sql: include_str!("schema/m003_is_short.sql"),
+    },
 ];
 
 /// Apply pending migrations. Idempotent — safe to call on every startup.

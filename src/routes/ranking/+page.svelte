@@ -46,6 +46,7 @@
     { value: 'animal', label: '動物' },
     { value: 'other', label: 'その他' },
   ];
+  // ショート動画は GENRE_KEY_BY_NAME に無いので直接キーを渡す
 
   const TERMS: { value: Term; label: string }[] = [
     { value: 'hour', label: '毎時' },
@@ -58,6 +59,7 @@
   let genre = $state<GenreName>('all');
   let term = $state<Term>('24h');
   let page = $state(1);
+  let rankShort = $state(false);
 
   let pending = $state(false);
   let error = $state<string | null>(null);
@@ -180,7 +182,7 @@
     pending = true;
     error = null;
     try {
-      const genreKey = GENRE_KEY_BY_NAME[genre];
+      const genreKey = rankShort ? 'short' : GENRE_KEY_BY_NAME[genre];
       const params = new URLSearchParams({ term, page: String(page) });
       const url = `https://www.nicovideo.jp/ranking/genre/${genreKey}?${params}`;
       const html = await invoke<string>('fetch_ranking_html', { url });
@@ -273,6 +275,13 @@
           {g.label}
         </button>
       {/each}
+    </div>
+
+    <div class="row">
+      <label class="short-rank-toggle">
+        <input type="checkbox" bind:checked={rankShort} onchange={runFetch} />
+        <span>ショート</span>
+      </label>
     </div>
 
     <div class="row">
@@ -756,5 +765,17 @@
   }
   .pagination button:hover {
     background: var(--theme-accent-hover);
+  }
+  .short-rank-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--theme-text-soft);
+    cursor: pointer;
+    user-select: none;
+  }
+  .short-rank-toggle input {
+    accent-color: var(--theme-accent);
   }
 </style>
