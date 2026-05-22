@@ -11,6 +11,7 @@
 
   let history = $state<HistoryItem[]>([]);
   let filter = $state<'all' | HistorySource>('all');
+  let filterShort = $state(false);
   let searchQuery = $state('');
 
   onMount(() => {
@@ -19,6 +20,9 @@
 
   let visible = $derived.by(() => {
     let list = history;
+    if (filterShort) {
+      list = list.filter((h) => h.videoId.startsWith('ss'));
+    }
     if (filter !== 'all') {
       list = list.filter((h) => (h.source ?? 'online') === filter);
     }
@@ -110,6 +114,13 @@
           aria-selected={filter === 'local'}
           class:active={filter === 'local'}
           onclick={() => (filter = 'local')}>ローカル ({counts.local})</button
+        >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={filterShort}
+          class:active={filterShort}
+          onclick={() => (filterShort = !filterShort)}>ショート</button
         >
       </div>
       <button type="button" class="clear-btn" onclick={handleClear} disabled={history.length === 0}>

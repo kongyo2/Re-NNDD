@@ -1644,7 +1644,8 @@ async fn run_one_download(
             video_path: Some(format!("videos/{video_id}/video.mp4")),
             raw_meta_json,
             resolution: resolution.clone(),
-            is_short: p.video.content_type.as_deref() == Some("short"),
+            is_short: p.video.content_type.as_deref() == Some("short")
+                || video_id.starts_with("ss"),
         }
     } else {
         // watch page が取れなかったケース（fallback）。yt-dlp info.json から組む。
@@ -1686,7 +1687,7 @@ async fn run_one_download(
             video_path: Some(format!("videos/{video_id}/video.mp4")),
             raw_meta_json: serde_json::to_string(info).ok(),
             resolution: resolution.clone(),
-            is_short: is_short_fallback,
+            is_short: is_short_fallback || video_id.starts_with("ss"),
         }
     };
     let tag_records: Vec<TagRecord> = if let Some(p) = page.as_ref() {
