@@ -184,7 +184,7 @@
     // NiconiComments のフォント高さがキャンバス高さに引きずられて
     // 縦長になるのを軽く補正する。
     const canvasAspect = Math.min(1, canvas.width / canvas.height);
-    const ncScale = 0.7 + canvasAspect * 0.3;
+    const ncScale = 0.5 + canvasAspect * 0.5;
 
     const byFork = new SvelteMap<string, ReturnType<typeof toV1Comment>[]>();
     for (const c of comments) {
