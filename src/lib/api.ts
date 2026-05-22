@@ -391,6 +391,7 @@ export type LocalPlaybackPayload = {
   localAudioPath: string | null;
   localThumbnailPath: string | null;
   comments: LocalPlayerCommentDto[];
+  isShort: boolean;
 };
 
 export async function listLibraryVideos(): Promise<LibraryVideoItem[]> {

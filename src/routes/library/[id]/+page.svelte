@@ -665,6 +665,7 @@
                 onTogglePip={togglePip}
                 pipActive={false}
                 forceAutoplay={shouldForceAutoplay(lp.videoId)}
+                short={lp.isShort}
               />
             {/key}
           {/if}

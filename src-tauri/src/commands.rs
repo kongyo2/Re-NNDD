@@ -2187,6 +2187,8 @@ pub struct LocalPlaybackPayload {
     pub local_audio_path: Option<String>,
     pub local_thumbnail_path: Option<String>,
     pub comments: Vec<LocalPlayerComment>,
+    /// 縦長ショート動画かどうか。resolution から判定。
+    pub is_short: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2194,6 +2196,18 @@ pub struct LocalPlaybackPayload {
 pub struct LibraryTag {
     pub name: String,
     pub is_locked: bool,
+}
+
+/// resolution の "{w}x{h}" 形式から縦長（高さ > 幅）ならショートと判定。
+fn is_short_from_resolution(resolution: Option<&str>) -> bool {
+    if let Some(res) = resolution {
+        if let Some((w_str, h_str)) = res.split_once('x') {
+            let w: i64 = w_str.parse().unwrap_or(0);
+            let h: i64 = h_str.parse().unwrap_or(0);
+            return h > w && w > 0;
+        }
+    }
+    false
 }
 
 /// ローカルに DL 済みの動画がある場合のみ Some を返す。
@@ -2219,7 +2233,7 @@ pub async fn prepare_local_playback(
     let video_row = conn
         .query_row(
             "SELECT id, title, description, duration_sec, uploader_id, uploader_name, uploader_type, \
-                    view_count, comment_count, mylist_count, posted_at, thumbnail_url, video_path \
+                    view_count, comment_count, mylist_count, posted_at, thumbnail_url, video_path, resolution \
              FROM videos WHERE id = ?1",
             rusqlite::params![video_id],
             |row| {
@@ -2237,6 +2251,7 @@ pub async fn prepare_local_playback(
                     row.get::<_, Option<i64>>(10)?,
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -2247,6 +2262,8 @@ pub async fn prepare_local_playback(
     let Some(video_rel_path) = row.12 else {
         return Ok(None);
     };
+
+    let is_short = is_short_from_resolution(row.13.as_deref());
 
     let abs_video = app_data_dir.join(&video_rel_path);
     if !abs_video.exists() {
@@ -2357,6 +2374,7 @@ pub async fn prepare_local_playback(
         local_audio_path: abs_audio,
         local_thumbnail_path: thumb_abs,
         comments,
+        is_short,
     }))
 }
 
