@@ -180,6 +180,12 @@
     // Pre-binding '2d' makes getContext('webgl2') return null inside NC.
     canvas.getContext('2d');
 
+    // 16:9 より狭いアスペクト比（肖像/ショート動画）では、
+    // NiconiComments のフォント高さがキャンバス高さに引きずられて
+    // 縦長になるのを軽く補正する。
+    const canvasAspect = Math.min(1, canvas.width / canvas.height);
+    const ncScale = 0.7 + canvasAspect * 0.3;
+
     const byFork = new SvelteMap<string, ReturnType<typeof toV1Comment>[]>();
     for (const c of comments) {
       const fork = c.fork || 'main';
@@ -198,6 +204,7 @@
       // V1 コメは HTML5 系レンダラで描く。default は legacy/flash に
       // 切り替わる経路があり、稀に解釈ズレが起きるので明示する。
       mode: 'html5',
+      scale: ncScale,
       // Linux/X11 で defaultConfig が generic フォントになるのを上書き
       config: buildConfigOverride() as never,
     });
