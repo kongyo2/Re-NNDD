@@ -71,4 +71,29 @@ describe('plugin eventBus', () => {
     bus.emit('evt', null);
     expect(seen).toEqual(['first', 'first', 'second-from-first']);
   });
+
+  it('re-on with same (owner, handler) is deduplicated (one invocation per emit)', () => {
+    const h = vi.fn();
+    const off1 = bus.on('plug.a', 'evt', h);
+    const off2 = bus.on('plug.a', 'evt', h);
+    expect(bus._handlerCount()).toBe(1);
+    bus.emit('evt', null);
+    expect(h).toHaveBeenCalledTimes(1);
+    // Either off function should remove the single underlying entry.
+    off1();
+    expect(bus._handlerCount()).toBe(0);
+    // off2 is a no-op now (the entry is already gone).
+    off2();
+    bus.emit('evt', null);
+    expect(h).toHaveBeenCalledTimes(1);
+  });
+
+  it('different owners with same handler are NOT deduplicated', () => {
+    const h = vi.fn();
+    bus.on('plug.a', 'evt', h);
+    bus.on('plug.b', 'evt', h);
+    expect(bus._handlerCount()).toBe(2);
+    bus.emit('evt', null);
+    expect(h).toHaveBeenCalledTimes(2);
+  });
 });

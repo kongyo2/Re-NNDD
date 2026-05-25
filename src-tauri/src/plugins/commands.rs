@@ -138,19 +138,38 @@ pub async fn plugin_install_from_zip(
     let manifest_json = serde_json::to_string(&install_res.manifest)
         .map_err(|e| AppError::Other(format!("serialize manifest: {e}")))?;
     let now = now_unix_secs();
-    {
+    let previous_enabled = {
         let conn = library.lock().await;
-        registry::upsert(&conn, &install_res.manifest.id, &install_res.manifest.version, &manifest_json, now)
-            .map_err(AppError::from)?;
-    }
-    // in-memory にも反映 (有効状態は DB のデフォルト = false)。
-    runtime.upsert(&install_res.manifest.id, install_res.manifest.clone(), false);
+        // 上書き (replace=true) の場合は既存行の enabled フラグを保持したい。
+        // registry::upsert の SQL は ON CONFLICT 時に enabled を触らないので
+        // DB 側は既存値が残るが、in-memory runtime と返値 PluginInfo は
+        // ここで明示的に保持しないと split-brain になる (Codex review #1)。
+        let prev = registry::get(&conn, &install_res.manifest.id)
+            .map_err(AppError::from)?
+            .map(|r| r.enabled)
+            .unwrap_or(false);
+        registry::upsert(
+            &conn,
+            &install_res.manifest.id,
+            &install_res.manifest.version,
+            &manifest_json,
+            now,
+        )
+        .map_err(AppError::from)?;
+        prev
+    };
+    // in-memory にも反映 (既存行の enabled を維持)。
+    runtime.upsert(
+        &install_res.manifest.id,
+        install_res.manifest.clone(),
+        previous_enabled,
+    );
 
     // インストール直後の Info を返す。再ロード不要 (DB と一致しているはず)。
     Ok(row_to_info(
         &install_res.manifest.id,
         &install_res.manifest,
-        false,
+        previous_enabled,
         &root,
         now,
         now,

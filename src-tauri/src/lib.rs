@@ -69,17 +69,21 @@ pub fn run() {
                 local_server::start(videos_root).map_err(|e| format!("local server start: {e}"))?;
             app.manage(LocalServer { port });
 
-            // プラグインランタイムを DB から初期ロードする。失敗しても
-            // アプリ起動は止めない (プラグイン無しで通常起動を継続)。
+            // プラグインランタイムを DB から **同期的に** 初期ロードする。
+            // 起動直後に呼ばれる plugin_invoke が runtime 未 populate を見て
+            // UnknownPlugin/Disabled エラーを返すレースを防ぐため、Tauri が
+            // invoke を受け付け始める前にここで完了させる。失敗してもアプリ
+            // 起動は止めない (プラグイン無しで通常起動を継続)。
             let plugins_dir = data_dir.join("plugins");
             if let Err(e) = std::fs::create_dir_all(&plugins_dir) {
                 tracing::warn!(error = %e, "could not create plugins dir");
             }
-            let runtime_for_setup = Arc::clone(&plugin_runtime);
-            let library_for_setup = Arc::clone(&library);
-            tauri::async_runtime::spawn(async move {
-                plugins::runtime::bootstrap(&runtime_for_setup, &library_for_setup).await;
-            });
+            {
+                let conn = library.blocking_lock();
+                if let Err(e) = plugin_runtime.reload_from_db(&conn) {
+                    tracing::error!(error = %e, "plugin runtime initial load failed");
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

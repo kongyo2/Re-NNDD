@@ -16,6 +16,7 @@ import { pluginListInstalled, pluginSetEnabled } from './api';
 import { getBool } from '$lib/stores/settings.svelte';
 
 let bootstrapped = false;
+let bootstrapping = false;
 let bridgeUnlisten: UnlistenFn | null = null;
 
 type RustEventEnvelope = {
@@ -23,43 +24,56 @@ type RustEventEnvelope = {
   payload: unknown;
 };
 
-/** 起動時に呼ぶ。多重呼び出しは安全 (idempotent)。 */
+/** 起動時に呼ぶ。多重呼び出しは安全 (idempotent)。
+ *  初期リスト取得が失敗した場合は bootstrap 済みフラグを立てず、後続の
+ *  retry を許可する (Codex review #4: 一過性エラーでセッション中ずっと
+ *  プラグインがロードされなくなる問題の回避)。 */
 export async function bootstrapPluginHost(): Promise<void> {
-  if (bootstrapped) return;
-  bootstrapped = true;
-
-  // キルスイッチ。OFF ならばここから先に **絶対に副作用を持たせない**。
-  if (!getBool('plugins.enabled')) {
-    return;
-  }
-
-  // Rust → JS のプラグインイベント橋渡しを 1 本張る。
+  if (bootstrapped || bootstrapping) return;
+  bootstrapping = true;
   try {
-    bridgeUnlisten = await listen<RustEventEnvelope>('nndd:plugin:event', (ev) => {
-      const env = ev.payload;
-      if (env && typeof env === 'object' && typeof env.name === 'string') {
-        bus.emit(env.name, env.payload);
-      }
-    });
-  } catch (e) {
-    console.error('[plugin] failed to attach event bridge:', e);
-  }
-
-  let installed: Awaited<ReturnType<typeof pluginListInstalled>>;
-  try {
-    installed = await pluginListInstalled();
-  } catch (e) {
-    console.error('[plugin] failed to list installed:', e);
-    return;
-  }
-  for (const info of installed) {
-    if (!info.enabled) continue;
-    // 各プラグインは独立 try/catch (loader 内部でも catch しているが二重防御)
-    try {
-      await loader.loadPlugin(info);
-    } catch (e) {
-      console.error(`[plugin] load threw for ${info.pluginId}:`, e);
+    // キルスイッチ。OFF ならばここから先に **絶対に副作用を持たせない**。
+    if (!getBool('plugins.enabled')) {
+      bootstrapped = true; // キルスイッチ OFF はリトライ不要 (再起動で反映)
+      return;
     }
+
+    // Rust → JS のプラグインイベント橋渡しは 1 度だけ張る (リトライで多重
+    // listen にならないよう、bridgeUnlisten がある場合は skip)。
+    if (!bridgeUnlisten) {
+      try {
+        bridgeUnlisten = await listen<RustEventEnvelope>('nndd:plugin:event', (ev) => {
+          const env = ev.payload;
+          if (env && typeof env === 'object' && typeof env.name === 'string') {
+            bus.emit(env.name, env.payload);
+          }
+        });
+      } catch (e) {
+        console.error('[plugin] failed to attach event bridge:', e);
+      }
+    }
+
+    let installed: Awaited<ReturnType<typeof pluginListInstalled>>;
+    try {
+      installed = await pluginListInstalled();
+    } catch (e) {
+      console.error('[plugin] failed to list installed:', e);
+      return; // bootstrapped を立てずに return → 次回呼出でリトライ可能
+    }
+
+    // 列挙成功 → ここで bootstrap 完了扱い。各プラグイン load は独立 try/catch
+    // (失敗しても他プラグインと bootstrap 全体の成功扱いを巻き込まない)。
+    bootstrapped = true;
+    for (const info of installed) {
+      if (!info.enabled) continue;
+      try {
+        await loader.loadPlugin(info);
+      } catch (e) {
+        console.error(`[plugin] load threw for ${info.pluginId}:`, e);
+      }
+    }
+  } finally {
+    bootstrapping = false;
   }
 }
 
@@ -80,6 +94,7 @@ export async function disablePlugin(pluginId: string): Promise<void> {
 /** テスト用: bootstrap フラグを reset。 */
 export function _resetForTests(): void {
   bootstrapped = false;
+  bootstrapping = false;
   if (bridgeUnlisten) {
     try {
       bridgeUnlisten();

@@ -149,6 +149,21 @@ mod tests {
     }
 
     #[test]
+    fn upsert_preserves_enabled_on_conflict() {
+        // ON CONFLICT 時に enabled を書き換えてはいけない (Codex review #1)。
+        // 上書きインストール時にユーザが有効化状態を失わないため。
+        let conn = setup();
+        upsert(&conn, "a", "0.1.0", "{}", 1000).unwrap();
+        set_enabled(&conn, "a", true, 1100).unwrap();
+        // バージョンアップを擬似
+        upsert(&conn, "a", "0.2.0", "{\"v\":2}", 2000).unwrap();
+        let row = get(&conn, "a").unwrap().unwrap();
+        assert!(row.enabled, "enabled flag must survive a version upsert");
+        assert_eq!(row.version, "0.2.0");
+        assert_eq!(row.manifest_json, "{\"v\":2}");
+    }
+
+    #[test]
     fn delete_removes_row() {
         let conn = setup();
         upsert(&conn, "a", "0.1.0", "{}", 1000).unwrap();

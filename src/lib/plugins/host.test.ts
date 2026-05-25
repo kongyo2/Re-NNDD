@@ -85,4 +85,33 @@ describe('bootstrapPluginHost — kill switch', () => {
     await host.bootstrapPluginHost();
     expect(api.pluginListInstalled).toHaveBeenCalledTimes(1);
   });
+
+  it('initial list failure does NOT permanently lock out — retry succeeds', async () => {
+    (settings as unknown as { __setEnabled(v: boolean): void }).__setEnabled(true);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    (api.pluginListInstalled as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockResolvedValueOnce([]);
+    await host.bootstrapPluginHost();
+    // 1st call fails; bootstrap latch should NOT be set so a 2nd call retries.
+    await host.bootstrapPluginHost();
+    expect(api.pluginListInstalled).toHaveBeenCalledTimes(2);
+    // 2nd attempt succeeded; a 3rd call should be a no-op.
+    await host.bootstrapPluginHost();
+    expect(api.pluginListInstalled).toHaveBeenCalledTimes(2);
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('event bridge listen is attached at most once across retries', async () => {
+    (settings as unknown as { __setEnabled(v: boolean): void }).__setEnabled(true);
+    (api.pluginListInstalled as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('fail-1'))
+      .mockResolvedValueOnce([]);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await host.bootstrapPluginHost();
+    await host.bootstrapPluginHost();
+    expect(listen).toHaveBeenCalledTimes(1);
+    errSpy.mockRestore();
+  });
 });

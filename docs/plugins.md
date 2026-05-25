@@ -85,7 +85,7 @@ Windows: `%APPDATA%\in.yajuvideo.nndd-next\`)。
 | `library.read` | `library.list` | ローカルライブラリの動画一覧を取得 (`{limit?, offset?}` → ページング結果) |
 | `settings.read` | `settings.get` | `plugin.<id>.*` キーの値を取得 (他キーは拒否) |
 | `settings.write` | `settings.set` | `plugin.<id>.*` キーに保存 (他キーは拒否) |
-| `notify` | `notify.toast` | フロントの toast に文字列を出す (`{message, kind?}`) |
+| `notify` | `notify.toast` | フロント側プラグインイベントバスに `notify:toast` を emit する (`{message, kind?}` → `{pluginId, message, kind}`)。トーストを実 UI に出すかは購読側 (他プラグイン / 将来のアプリ標準 toast UI) の責務 |
 
 ## Plugin API (`activate(ctx)`)
 

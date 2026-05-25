@@ -13,7 +13,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::library::db::LibraryHandle;
 use crate::library::query::{self as lib_query, LibraryQuery};
@@ -319,14 +319,18 @@ fn handle_notify_toast(
         }
     })?;
     let kind = req.kind.unwrap_or_else(|| "info".to_string());
-    let payload_out = json!({
-        "pluginId": plugin_id,
-        "message": req.message,
-        "kind": kind,
-    });
-    if let Err(e) = app.emit("nndd:plugin:toast", payload_out) {
-        return Err(DispatchError::Upstream(format!("emit: {e}")));
-    }
+    // ホストの host.ts は `nndd:plugin:event` を 1 本だけ listen している。
+    // ここで独立チャンネル名を使うとフロントに届かない (Codex review #5) ため、
+    // 共通の emit_event ヘルパ経由で `notify:toast` イベントとして配信する。
+    crate::plugins::emit_event(
+        app,
+        "notify:toast",
+        json!({
+            "pluginId": plugin_id,
+            "message": req.message,
+            "kind": kind,
+        }),
+    );
     Ok(Value::Null)
 }
 

@@ -78,20 +78,18 @@ pub fn install_from_zip_bytes(
     }
 
     let target = plugins_root.join(&manifest.id);
-    if target.exists() {
-        if !replace {
-            return Err(InstallError::AlreadyInstalled(manifest.id.clone()));
-        }
-        std::fs::remove_dir_all(&target)?;
+    if target.exists() && !replace {
+        return Err(InstallError::AlreadyInstalled(manifest.id.clone()));
     }
 
+    // ① まず tmp に全部展開する (target には触らない)。展開途中で zip 破損
+    //   や IO エラーが出ても、既存のプラグインは無傷で残る (Codex review #3)。
     let tmp = plugins_root.join(format!("{}.tmp-{}", manifest.id, std::process::id()));
     if tmp.exists() {
         std::fs::remove_dir_all(&tmp)?;
     }
     std::fs::create_dir_all(&tmp)?;
 
-    // 全エントリを tmp に展開
     let extract_result: Result<(), InstallError> = (|| {
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
@@ -115,9 +113,38 @@ pub fn install_from_zip_bytes(
         return Err(e);
     }
 
+    // ② 展開成功。target が既存ならいったん backup へ退避してから tmp を
+    //   target に rename する。final rename 失敗時は backup を target に
+    //   戻して "なかったこと" にする。
+    let backup = if target.exists() {
+        let bk =
+            plugins_root.join(format!("{}.bak-{}", manifest.id, std::process::id()));
+        if bk.exists() {
+            std::fs::remove_dir_all(&bk)?;
+        }
+        if let Err(e) = std::fs::rename(&target, &bk) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(InstallError::Io(e));
+        }
+        Some(bk)
+    } else {
+        None
+    };
+
     if let Err(e) = std::fs::rename(&tmp, &target) {
         let _ = std::fs::remove_dir_all(&tmp);
+        if let Some(bk) = backup {
+            // 旧プラグインを元に戻す。これ自体が失敗するとユーザ介入が必要
+            // だが、backup ディレクトリ自体は残しておくのでデータ消失は無い。
+            let _ = std::fs::rename(&bk, &target);
+        }
         return Err(InstallError::Io(e));
+    }
+
+    // 成功 → backup を片付ける (失敗しても致命ではない、次回再 install で
+    // 旧 backup ディレクトリは tmp 衝突防止と同様に削除される)。
+    if let Some(bk) = backup {
+        let _ = std::fs::remove_dir_all(&bk);
     }
 
     Ok(InstallResult {
@@ -253,6 +280,34 @@ mod tests {
         ]);
         install_from_zip_bytes(tmp.path(), &body, false, "0.1.0").unwrap();
         install_from_zip_bytes(tmp.path(), &body, true, "0.1.0").unwrap();
+    }
+
+    #[test]
+    fn replace_swaps_contents_to_new_version() {
+        // v1 → v2 で index.js の中身が確実に置き換わることを検証 (backup + rename
+        // 経由の atomic swap が機能している)。
+        let tmp = TempDir::new().unwrap();
+        let v1 = zip_with(&[
+            ("manifest.json", &manifest_bytes("com.example.swap")),
+            ("index.js", b"export const v = 1;"),
+        ]);
+        let v2 = zip_with(&[
+            ("manifest.json", &manifest_bytes("com.example.swap")),
+            ("index.js", b"export const v = 2;"),
+        ]);
+        let r1 = install_from_zip_bytes(tmp.path(), &v1, false, "0.1.0").unwrap();
+        let written_v1 = std::fs::read_to_string(r1.installed_at.join("index.js")).unwrap();
+        assert_eq!(written_v1, "export const v = 1;");
+        let r2 = install_from_zip_bytes(tmp.path(), &v2, true, "0.1.0").unwrap();
+        let written_v2 = std::fs::read_to_string(r2.installed_at.join("index.js")).unwrap();
+        assert_eq!(written_v2, "export const v = 2;");
+        // backup ディレクトリは片付いている
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.contains(".bak-") || n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover dirs: {leftovers:?}");
     }
 
     #[test]

@@ -8,7 +8,9 @@
 // - 1 ハンドラが throw しても他のハンドラ呼び出しは続行する
 // - `offAllByOwner(token)` で同じ owner (= plugin id) のハンドラを一括解除
 //   できる (プラグインの uninstall / disable 時に使う)
-// - 同じ name に同じハンドラを 2 度 on しても 1 度しか登録しない (Set 動作)
+// - 同じ (owner, name, handler) を 2 度 on しても 1 度しか登録しない
+//   (Set に新しい entry object を入れる素朴な実装だと dedup されないので、
+//   挿入前に既存 entry を線形検索する; Codex review #6)
 
 type AnyHandler = (payload: unknown) => void;
 
@@ -46,9 +48,21 @@ export function emit(name: string, payload: unknown): void {
 }
 
 /** ハンドラを登録。返値の関数を呼ぶと off できる。
- *  `owner` は plugin id を渡す (一括解除用)。 */
+ *  `owner` は plugin id を渡す (一括解除用)。
+ *  同じ `(owner, handler)` の組での再登録は no-op (既存 entry を返す)。 */
 export function on(owner: string, name: string, handler: AnyHandler): () => void {
   const b = bucketOf(name);
+  // Set でも entry object が毎回新規だと重複登録になるので、(owner, handler)
+  // の同値性で線形検索して dedup する。バケット当たりの listener 数は通常
+  // 高々数件想定なので線形でよい。
+  for (const existing of b) {
+    if (existing.owner === owner && existing.handler === handler) {
+      return () => {
+        b.delete(existing);
+        if (b.size === 0) buckets.delete(name);
+      };
+    }
+  }
   const entry: Entry = { owner, handler };
   b.add(entry);
   return () => {
