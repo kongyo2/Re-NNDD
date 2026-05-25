@@ -225,6 +225,49 @@ pub fn install_from_zip_bytes(
     })
 }
 
+/// 起動時に `<plugins_root>` 直下の `<id>.tmp-*` / `<id>.bak-*` ディレクトリを
+/// **ベストエフォート** で削除する。前回プロセスが install/uninstall 中に
+/// クラッシュした場合、これらの中間ディレクトリは残留してディスクを圧迫し、
+/// 次回 install での tmp 衝突 (= 古いゴミの remove_dir_all) の race 原因に
+/// もなる。
+///
+/// プラグイン本体ディレクトリ (`<id>`) は **絶対に消さない**。サフィックスが
+/// `.tmp-` / `.bak-` で始まる名前のみが対象。失敗は warn ログに留めて続行。
+pub fn cleanup_stale_dirs(plugins_root: &Path) {
+    let read_dir = match std::fs::read_dir(plugins_root) {
+        Ok(rd) => rd,
+        Err(e) => {
+            tracing::warn!(error = %e, "plugins cleanup: read_dir failed");
+            return;
+        }
+    };
+    let mut removed = 0usize;
+    for entry in read_dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // installer が作る命名は `<id>.tmp-<pid>-<counter>` / `<id>.bak-<pid>-<counter>`。
+        // `<id>` 部分には ASCII 英小字数字 `._-` しか入らないため、`.tmp-` /
+        // `.bak-` を含むかどうかでフィルタすれば誤判定はない (プラグイン id
+        // 自体には `.tmp-` を含められない: id charset に space や `+` が無く、
+        // 連結のドットも 64 文字上限で抑止される)。
+        if name.contains(".tmp-") || name.contains(".bak-") {
+            let path = entry.path();
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    removed += 1;
+                    tracing::info!(path = %path.display(), "plugins cleanup: removed stale dir");
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "plugins cleanup: remove failed");
+                }
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "plugins cleanup completed");
+    }
+}
+
 pub fn uninstall(plugins_root: &Path, plugin_id: &str) -> Result<(), InstallError> {
     if !crate::plugins::manifest::is_valid_plugin_id(plugin_id) {
         return Err(InstallError::UnsafePath(plugin_id.to_string()));
@@ -439,6 +482,40 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let err = uninstall(tmp.path(), "../etc").unwrap_err();
         matches!(err, InstallError::UnsafePath(_));
+    }
+
+    #[test]
+    fn cleanup_removes_tmp_and_bak_only() {
+        // 起動時 cleanup が `.tmp-*` / `.bak-*` のみを消し、本体ディレクトリは
+        // 残すことを確認 (前回 crash 後の orphan ディレクトリ対策の回帰防止)。
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("com.example.live")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("com.example.live.tmp-12345-0")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("com.example.live.bak-12345-1")).unwrap();
+        // ID 自体に "tmp" が含まれていても、`.tmp-` パターンには該当しないので残る。
+        std::fs::create_dir_all(tmp.path().join("tmpid")).unwrap();
+        cleanup_stale_dirs(tmp.path());
+        let names: std::collections::HashSet<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains("com.example.live"), "live dir must survive");
+        assert!(
+            names.contains("tmpid"),
+            "id with 'tmp' substring must survive"
+        );
+        assert!(!names.contains("com.example.live.tmp-12345-0"));
+        assert!(!names.contains("com.example.live.bak-12345-1"));
+    }
+
+    #[test]
+    fn cleanup_missing_root_does_not_panic() {
+        // root が存在しない (= app_data_dir が未作成) ケースも noop で返る。
+        let tmp = TempDir::new().unwrap();
+        let nonexistent = tmp.path().join("nope");
+        cleanup_stale_dirs(&nonexistent);
+        // 例外なしで戻ればよい (削除対象なし)。
     }
 
     #[test]

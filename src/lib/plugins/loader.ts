@@ -12,13 +12,17 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import * as bus from './eventBus';
 import * as registry from './registry';
 import { pluginInvoke } from './api';
+import { getPlayerState } from './playerState.svelte';
+import { showToast } from '$lib/toastStore.svelte';
 import type {
+  PluginCommand,
   PluginContext,
   PluginInfo,
   PluginItemAction,
   PluginManifest,
   PluginModule,
   PluginNavEntry,
+  PluginPageRenderer,
   PluginPlayerAction,
   PluginSettingDef,
 } from './types';
@@ -51,6 +55,11 @@ function buildContext(info: PluginInfo): PluginContext {
   };
   const pid = info.pluginId;
   const logTag = `[plugin:${pid}]`;
+  // settings key prefix。`:` 区切りで dot-prefix 攻撃を防ぐ (dispatcher と一致)。
+  const settingsPrefix = `plugin:${pid}:`;
+  // player.command の薄いラッパ。kind の妥当性は Rust 側でも再検査される。
+  const playerCmd = (kind: string, value?: number) =>
+    pluginInvoke(pid, 'player.command', { kind, value: value ?? null }) as Promise<unknown>;
   return {
     manifest,
     events: {
@@ -64,11 +73,8 @@ function buildContext(info: PluginInfo): PluginContext {
     settings: {
       register(def: PluginSettingDef) {
         // key prefix の防御 (Rust 側でも enforce されるが UX のため事前に弾く)
-        // 区切りに `:` を使う (plugin_id が `.` を含むケースでの dot-prefix
-        // 攻撃を防ぐ — dispatcher 側と一致させる)。
-        const prefix = `plugin:${pid}:`;
-        if (!def.key.startsWith(prefix)) {
-          console.warn(logTag, 'settings.register rejected: key must start with', prefix);
+        if (!def.key.startsWith(settingsPrefix)) {
+          console.warn(logTag, 'settings.register rejected: key must start with', settingsPrefix);
           return;
         }
         registry.addSetting(pid, def);
@@ -93,6 +99,58 @@ function buildContext(info: PluginInfo): PluginContext {
     player: {
       addAction(action: PluginPlayerAction) {
         registry.addPlayerAction(pid, action);
+      },
+      // 状態取得は Rust を介さない (フロント module-state を読むだけ)。
+      // permission チェックは `player.command` (= 実操作) にのみ課す設計
+      // (state read は副作用ゼロ)。詳細は docs/plugins.md。
+      getState() {
+        return getPlayerState();
+      },
+      play() {
+        return playerCmd('play') as Promise<void>;
+      },
+      pause() {
+        return playerCmd('pause') as Promise<void>;
+      },
+      toggle() {
+        return playerCmd('toggle') as Promise<void>;
+      },
+      seek(toSec: number) {
+        return playerCmd('seek', toSec) as Promise<void>;
+      },
+      setRate(rate: number) {
+        return playerCmd('setRate', rate) as Promise<void>;
+      },
+      setVolume(vol: number) {
+        return playerCmd('setVolume', vol) as Promise<void>;
+      },
+      toggleMute() {
+        return playerCmd('toggleMute') as Promise<void>;
+      },
+    },
+    commands: {
+      register(cmd: PluginCommand) {
+        // 組込みコマンドの名前空間 `app.*` への侵害を弾く (UX 上の混乱防止)。
+        // プラグインの commands は何でも入れていいが、`app.` 始まりだけ予約。
+        if (cmd.id.startsWith('app.')) {
+          console.warn(logTag, 'commands.register rejected: id `app.*` is reserved');
+          return;
+        }
+        registry.addCommand(pid, cmd);
+      },
+    },
+    pages: {
+      register(subpath: string, render: PluginPageRenderer) {
+        registry.addPage(pid, subpath, render);
+      },
+    },
+    ui: {
+      // ホスト直のトースト (permission `notify` 不要)。プラグイン作者の
+      // 「最低限のフィードバック手段」を低摩擦に提供する。
+      toast(message: string, kind = 'info') {
+        const k: 'info' | 'ok' | 'warn' | 'error' =
+          kind === 'ok' || kind === 'warn' || kind === 'error' ? kind : 'info';
+        showToast(message, k, { pluginId: pid });
       },
     },
     invoke(action: string, payload?: unknown) {
