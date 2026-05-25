@@ -102,16 +102,14 @@
   });
 </script>
 
+<!-- パレットの ArrowUp/Down/Enter/Esc は <svelte:window> でだけ受ける。
+     backdrop / panel にも onkeydown を貼ると、input から bubble してきた
+     keydown を 2 度処理して highlight が 2 段ジャンプする (Codex r3298977867)。 -->
 <svelte:window onkeydown={onKeydownPanel} />
 
 {#if isPaletteOpen()}
   <!-- backdrop は role=presentation。実フォーカストラップは入力要素自体。 -->
-  <div
-    class="backdrop"
-    role="presentation"
-    onmousedown={onBackdropClick}
-    onkeydown={onKeydownPanel}
-  >
+  <div class="backdrop" role="presentation" onmousedown={onBackdropClick}>
     <div
       class="panel"
       bind:this={containerEl}

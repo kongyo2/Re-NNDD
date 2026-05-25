@@ -130,6 +130,17 @@ function buildContext(info: PluginInfo): PluginContext {
     },
     commands: {
       register(cmd: PluginCommand) {
+        // `commands` permission を持たないプラグインは register できない。
+        // permission モデルの一貫性のため (manifest で `commands` を宣言した
+        // プラグインのみがコマンドパレットに項目を追加可能)。
+        // Codex review r3298977870 の指摘に対応。
+        if (!info.permissions.includes('commands')) {
+          console.warn(
+            logTag,
+            'commands.register rejected: manifest.permissions に "commands" がありません',
+          );
+          return;
+        }
         // 組込みコマンドの名前空間 `app.*` への侵害を弾く (UX 上の混乱防止)。
         // プラグインの commands は何でも入れていいが、`app.` 始まりだけ予約。
         if (cmd.id.startsWith('app.')) {

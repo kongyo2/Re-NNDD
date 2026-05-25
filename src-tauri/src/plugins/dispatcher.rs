@@ -505,30 +505,15 @@ async fn handle_library_get(
             message: e.to_string(),
         })?;
     validate_video_id(&req.video_id)?;
-    // 同一プラグインから何度も叩かれても重いことはない (PK lookup)。LibraryQuery
-    // は q (title FTS) も含めるので、`q = Some(videoId)` ではなく `library.list`
-    // 同様に全件取得して videoId で線形フィルタ ... ではなく、現状 query.rs に
-    // ID 検索 API が無いため、まず q で曖昧検索したうえで完全一致を抽出する。
-    // library テーブルの行数が少ない (= ローカルライブラリ) ため許容可能。
-    let q = LibraryQuery {
-        q: Some(req.video_id.clone()),
-        tags: None,
-        tags_any: None,
-        uploader_id: None,
-        min_duration: None,
-        max_duration: None,
-        resolution: None,
-        is_short: None,
-        sort_by: Some("downloaded_at".into()),
-        sort_order: Some("desc".into()),
-        offset: Some(0),
-        limit: Some(50),
-    };
+    // PK 直接 lookup。以前は LibraryQuery の `q` (title/tag/comments FTS) で
+    // 検索していたが、`q` は ID にはマッチしないので、ID が title 等に
+    // 含まれない動画では存在しても null を返してしまう契約違反があった
+    // (Codex review r3298977860)。専用の `get_video_by_id` を query.rs に
+    // 追加して使う。
     let conn = library.lock().await;
-    let res =
-        lib_query::query_videos(&conn, &q).map_err(|e| DispatchError::Upstream(e.to_string()))?;
-    let found = res.items.into_iter().find(|v| v.id == req.video_id);
-    Ok(match found {
+    let v = lib_query::get_video_by_id(&conn, &req.video_id)
+        .map_err(|e| DispatchError::Upstream(e.to_string()))?;
+    Ok(match v {
         Some(v) => json!({
             "videoId": v.id,
             "title": v.title,

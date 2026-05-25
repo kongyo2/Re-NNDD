@@ -9,7 +9,6 @@
   // appliesTo() が plugin-supplied なので必ず try/catch で囲む — render
   // 中の throw でカードが壊れない設計 (SearchHitCard と同じ防御方針)。
 
-  import { onMount, onDestroy } from 'svelte';
   import { pluginItemActions } from '$lib/plugins/registry';
   import { showToast } from '$lib/toastStore.svelte';
   import type { PluginItemAction } from '$lib/plugins/types';
@@ -72,14 +71,20 @@
   }
 
   function onDocClick(e: MouseEvent) {
-    if (!menuOpen) return;
     const t = e.target as Node;
     if (menuEl?.contains(t) || menuBtn?.contains(t)) return;
     menuOpen = false;
   }
 
-  onMount(() => document.addEventListener('mousedown', onDocClick));
-  onDestroy(() => document.removeEventListener('mousedown', onDocClick));
+  // ranking / library 等で 100 件以上のカードが並ぶページでは、各カードが
+  // 常時 document mousedown を listen していると、クリックごとに全件分の
+  // handler が走って性能劣化する (Codex r3298977877)。
+  // メニューが open のときだけ listener を貼り、close 時に外す。
+  $effect(() => {
+    if (!menuOpen) return;
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  });
 </script>
 
 {#if actions.length > 0}

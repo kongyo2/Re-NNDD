@@ -18,6 +18,10 @@
   let mountEl: HTMLDivElement | null = $state(null);
   let cleanup: (() => void) | null = null;
   let errorMessage = $state<string | null>(null);
+  // ルート変化のたびにインクリメントする世代カウンタ。renderer が async で
+  // 戻ってきたとき、自分の世代が最新かどうかを確認して stale な resolve が
+  // 新しい cleanup を上書きしないようにする (Codex r3298977876)。
+  let mountGeneration = 0;
 
   // ページ遷移 (id / path の変化) で renderer を mount し直す。`mountEl` が
   // bind:this で取れた直後の最初の effect 評価でマウントが起きる。
@@ -29,6 +33,12 @@
     const subpath = page.params.path ?? '';
     if (!mountEl) return;
     if (!id) return; // 念のため (起こらないはず)
+    // 世代を 1 つ進める。この effect のクロージャ内で `gen` をキャプチャし、
+    // 後続の Promise then の中で `gen === mountGeneration` を確認することで、
+    // 高速な subpath 切替で古い renderer が遅れて resolve しても新ページの
+    // cleanup を上書きしない。
+    mountGeneration += 1;
+    const gen = mountGeneration;
     // 前の renderer の cleanup を先に呼ぶ (subpath 切替時の listener 漏れ防止)。
     try {
       cleanup?.();
@@ -56,9 +66,22 @@
     Promise.resolve()
       .then(() => renderer(mountEl!))
       .then((maybeCleanup) => {
+        // 世代チェック: この呼出しが走っている間に subpath 遷移していたら、
+        // ここで得た cleanup は古いページ用なので即捨てる + 何も書き換えない。
+        if (gen !== mountGeneration) {
+          if (typeof maybeCleanup === 'function') {
+            try {
+              maybeCleanup();
+            } catch (e) {
+              console.error('[plugin page] stale renderer cleanup threw:', e);
+            }
+          }
+          return;
+        }
         if (typeof maybeCleanup === 'function') cleanup = maybeCleanup;
       })
       .catch((e) => {
+        if (gen !== mountGeneration) return; // stale な reject は無視
         console.error(`[plugin page] renderer for ${id}/${subpath} threw:`, e);
         errorMessage = `プラグインのレンダラがエラーを投げました: ${e}`;
       });

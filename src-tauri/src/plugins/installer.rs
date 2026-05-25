@@ -225,14 +225,20 @@ pub fn install_from_zip_bytes(
     })
 }
 
-/// 起動時に `<plugins_root>` 直下の `<id>.tmp-*` / `<id>.bak-*` ディレクトリを
-/// **ベストエフォート** で削除する。前回プロセスが install/uninstall 中に
-/// クラッシュした場合、これらの中間ディレクトリは残留してディスクを圧迫し、
-/// 次回 install での tmp 衝突 (= 古いゴミの remove_dir_all) の race 原因に
-/// もなる。
+/// 起動時に `<plugins_root>` 直下の `<id>.tmp-<pid>-<n>` /
+/// `<id>.bak-<pid>-<n>` ディレクトリを **ベストエフォート** で削除する。
+/// 前回プロセスが install/uninstall 中にクラッシュした場合、これらの中間
+/// ディレクトリは残留してディスクを圧迫し、次回 install での tmp 衝突
+/// (= 古いゴミの remove_dir_all) の race 原因にもなる。
 ///
-/// プラグイン本体ディレクトリ (`<id>`) は **絶対に消さない**。サフィックスが
-/// `.tmp-` / `.bak-` で始まる名前のみが対象。失敗は warn ログに留めて続行。
+/// プラグイン本体ディレクトリ (`<id>`) は **絶対に消さない**。判定は
+/// installer が生成する命名規約に **完全一致** したアンカー付き正規表現で行う:
+///
+///   `^.+\.(tmp|bak)-\d+-\d+$`
+///
+/// substring match (例: 名前に `.tmp-` を「含む」) だと、プラグイン id が
+/// `.` `-` `_` を含めるため `com.example.bak-feature` のような正規プラグイン
+/// が誤削除される (Codex review r3298977865)。失敗は warn ログに留めて続行。
 pub fn cleanup_stale_dirs(plugins_root: &Path) {
     let read_dir = match std::fs::read_dir(plugins_root) {
         Ok(rd) => rd,
@@ -245,27 +251,63 @@ pub fn cleanup_stale_dirs(plugins_root: &Path) {
     for entry in read_dir.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // installer が作る命名は `<id>.tmp-<pid>-<counter>` / `<id>.bak-<pid>-<counter>`。
-        // `<id>` 部分には ASCII 英小字数字 `._-` しか入らないため、`.tmp-` /
-        // `.bak-` を含むかどうかでフィルタすれば誤判定はない (プラグイン id
-        // 自体には `.tmp-` を含められない: id charset に space や `+` が無く、
-        // 連結のドットも 64 文字上限で抑止される)。
-        if name.contains(".tmp-") || name.contains(".bak-") {
-            let path = entry.path();
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => {
-                    removed += 1;
-                    tracing::info!(path = %path.display(), "plugins cleanup: removed stale dir");
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "plugins cleanup: remove failed");
-                }
+        if !is_stale_dir_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(path = %path.display(), "plugins cleanup: removed stale dir");
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "plugins cleanup: remove failed");
             }
         }
     }
     if removed > 0 {
         tracing::info!(removed, "plugins cleanup completed");
     }
+}
+
+/// `<base>.tmp-<pid>-<counter>` / `<base>.bak-<pid>-<counter>` の **完全一致**
+/// パターン判定。`base` (プラグイン id 部) には少なくとも 1 文字、
+/// `<pid>` / `<counter>` には 1 桁以上の 10 進数を要求する。
+fn is_stale_dir_name(name: &str) -> bool {
+    // 末尾から `-<digits>-<digits>$` を剥がす。手書き parser で regex 依存を
+    // 増やさない (zip-bomb 防止と同じく依存最小化方針)。
+    fn strip_digit_run(s: &str) -> Option<&str> {
+        let trim_end = s.trim_end_matches(|c: char| c.is_ascii_digit());
+        if trim_end.len() == s.len() {
+            return None; // 末尾が数字でない = digit run なし
+        }
+        Some(trim_end)
+    }
+    // suffix の counter
+    let s = match strip_digit_run(name) {
+        Some(s) => s,
+        None => return false,
+    };
+    // counter の手前は '-'
+    let s = match s.strip_suffix('-') {
+        Some(s) => s,
+        None => return false,
+    };
+    // pid
+    let s = match strip_digit_run(s) {
+        Some(s) => s,
+        None => return false,
+    };
+    // pid の手前は `.tmp-` or `.bak-`
+    let base = if let Some(b) = s.strip_suffix(".tmp-") {
+        b
+    } else if let Some(b) = s.strip_suffix(".bak-") {
+        b
+    } else {
+        return false;
+    };
+    // base 部 (= plugin id) は非空。空 base は installer が生成しないので除外。
+    !base.is_empty()
 }
 
 pub fn uninstall(plugins_root: &Path, plugin_id: &str) -> Result<(), InstallError> {
@@ -486,14 +528,21 @@ mod tests {
 
     #[test]
     fn cleanup_removes_tmp_and_bak_only() {
-        // 起動時 cleanup が `.tmp-*` / `.bak-*` のみを消し、本体ディレクトリは
-        // 残すことを確認 (前回 crash 後の orphan ディレクトリ対策の回帰防止)。
+        // 起動時 cleanup が `<id>.(tmp|bak)-<pid>-<n>$` のみを消し、本体
+        // ディレクトリは残すことを確認 (前回 crash 後の orphan ディレクトリ
+        // 対策の回帰防止)。
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("com.example.live")).unwrap();
         std::fs::create_dir_all(tmp.path().join("com.example.live.tmp-12345-0")).unwrap();
         std::fs::create_dir_all(tmp.path().join("com.example.live.bak-12345-1")).unwrap();
-        // ID 自体に "tmp" が含まれていても、`.tmp-` パターンには該当しないので残る。
+        // ID 自体に "tmp" が含まれていても、anchor 付きパターンには該当しない。
         std::fs::create_dir_all(tmp.path().join("tmpid")).unwrap();
+        // ID に `.bak-feature` を含む正規プラグイン (Codex review r3298977865)。
+        // 旧 substring match だと誤削除されていたが、今は残る。
+        std::fs::create_dir_all(tmp.path().join("com.example.bak-feature")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("com.tmp-helper.real")).unwrap();
+        // 末尾の counter が数字でない → 削除対象外。
+        std::fs::create_dir_all(tmp.path().join("com.example.live.tmp-12345-xyz")).unwrap();
         cleanup_stale_dirs(tmp.path());
         let names: std::collections::HashSet<String> = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -505,8 +554,36 @@ mod tests {
             names.contains("tmpid"),
             "id with 'tmp' substring must survive"
         );
+        assert!(
+            names.contains("com.example.bak-feature"),
+            "id with '.bak-feature' must survive (Codex r3298977865 regression guard)"
+        );
+        assert!(
+            names.contains("com.tmp-helper.real"),
+            "id with '.tmp-' inside must survive"
+        );
+        assert!(
+            names.contains("com.example.live.tmp-12345-xyz"),
+            "non-numeric counter suffix must not be treated as stale"
+        );
         assert!(!names.contains("com.example.live.tmp-12345-0"));
         assert!(!names.contains("com.example.live.bak-12345-1"));
+    }
+
+    #[test]
+    fn is_stale_dir_name_anchored() {
+        // 正規パターン (削除対象)
+        assert!(is_stale_dir_name("a.tmp-1-0"));
+        assert!(is_stale_dir_name("a.bak-12345-99"));
+        assert!(is_stale_dir_name("com.example.x.tmp-1-2"));
+        // 削除しないもの
+        assert!(!is_stale_dir_name("a.tmp-1")); // counter なし
+        assert!(!is_stale_dir_name("a.tmp--1")); // pid 空
+        assert!(!is_stale_dir_name(".tmp-1-2")); // base 空
+        assert!(!is_stale_dir_name("a.tmp-a-1")); // pid 非数字
+        assert!(!is_stale_dir_name("a.bak-1-x")); // counter 非数字
+        assert!(!is_stale_dir_name("com.example.bak-feature"));
+        assert!(!is_stale_dir_name("regular.plugin"));
     }
 
     #[test]
