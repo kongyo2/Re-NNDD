@@ -10,9 +10,11 @@
 //! 全コマンドが `Result<_, AppError>` を返し panic しない。
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::{AppError, Result};
 use crate::library::db::LibraryHandle;
@@ -22,6 +24,16 @@ use crate::plugins::manifest::PluginManifest;
 use crate::plugins::registry;
 use crate::plugins::runtime::PluginRuntime;
 use crate::plugins::DispatchError;
+
+/// install / uninstall コマンド全体を直列化する高位ロック。
+/// installer.rs 内部の INSTALL_MUTEX は fs 操作のみを守るため、
+/// `installer::install_from_zip_path` (fs) → `library.lock().await` → DB upsert
+/// → runtime.upsert の間に uninstall コマンドが割り込むと、install が
+/// 既に削除されたディレクトリに対して DB 行を作る race がある
+/// (Codex review r3298119187)。command 入口でこのロックを取り、
+/// fs/DB/runtime 全部終わるまで保持する。
+/// parking_lot は await を跨げないので、await を跨げる tokio Mutex を使う。
+static COMMAND_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,6 +141,7 @@ pub async fn plugin_install_from_zip(
     library: State<'_, Arc<LibraryHandle>>,
     runtime: State<'_, Arc<PluginRuntime>>,
 ) -> Result<PluginInfo> {
+    let _cmd_guard = COMMAND_LOCK.lock().await;
     let root = plugins_root(&app)?;
     let app_version = env!("CARGO_PKG_VERSION");
     let zip_path = std::path::PathBuf::from(&path);
@@ -201,6 +214,7 @@ pub async fn plugin_uninstall(
     library: State<'_, Arc<LibraryHandle>>,
     runtime: State<'_, Arc<PluginRuntime>>,
 ) -> Result<()> {
+    let _cmd_guard = COMMAND_LOCK.lock().await;
     let root = plugins_root(&app)?;
     // 1) DB を canonical として先に削除する。これが失敗した場合は何もしないで
     //    エラーを返す → ファイルも runtime も無変更で、ユーザは安全に retry できる
