@@ -118,8 +118,13 @@ export async function enablePlugin(info: import('./types').PluginInfo): Promise<
  *  ので、呼出側 (settings UI) は plugin の状態が変わっていないことを前提に
  *  リトライできる。 */
 export async function disablePlugin(pluginId: string): Promise<void> {
-  // 橋が attach できていない可能性をリトライ (Codex #10)。
-  await ensureEventBridge();
+  // キルスイッチが OFF のときは event bridge も attach しない (Codex #5 P3:
+  // disable 経路がキルスイッチを無視して listen を仕掛けてしまう抜け穴)。
+  // unload / DB 更新自体は OFF でも安全に行ってよい (むしろ「無効化」が
+  // できないと UX が壊れる)。
+  if (getBool('plugins.enabled')) {
+    await ensureEventBridge();
+  }
   await pluginSetEnabled(pluginId, false);
   await loader.unloadPlugin(pluginId);
 }

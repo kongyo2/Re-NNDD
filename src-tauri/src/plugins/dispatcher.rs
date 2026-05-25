@@ -132,6 +132,30 @@ async fn handle_net_fetch(payload: Value) -> Result<Value, DispatchError> {
             message: format!("host blocked by SSRF guard ({reason})"),
         });
     }
+    // ----- DNS を事前解決し、解決後の IP を再検証 (Codex #5 P1: host が
+    //   public 名でも DNS で 127.0.0.1 を返すような rebinding 攻撃を遮断) -----
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let lookup_target = format!("{host}:{port}");
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&lookup_target)
+        .await
+        .map_err(|e| DispatchError::Upstream(format!("dns resolve {host}: {e}")))?
+        .collect();
+    if resolved.is_empty() {
+        return Err(DispatchError::Upstream(format!(
+            "dns: no addresses for {host}"
+        )));
+    }
+    for addr in &resolved {
+        if ip_is_private(addr.ip()) {
+            return Err(DispatchError::InvalidPayload {
+                action: "net.fetch".into(),
+                message: format!(
+                    "host {host} resolves to private/loopback IP {} (SSRF guard)",
+                    addr.ip()
+                ),
+            });
+        }
+    }
     let method = req.method.as_deref().unwrap_or("GET").to_uppercase();
     let method = match method.as_str() {
         "GET" => reqwest::Method::GET,
@@ -146,14 +170,20 @@ async fn handle_net_fetch(payload: Value) -> Result<Value, DispatchError> {
             })
         }
     };
-    // ----- reqwest クライアント (timeout + redirect なし + UA 固定) -----
-    let client = reqwest::Client::builder()
+    // ----- reqwest クライアント (timeout + redirect なし + UA 固定 + 事前解決 IP 固定) -----
+    let mut client_builder = reqwest::Client::builder()
         .user_agent("Re-NNDD-plugin/0.1")
         .timeout(NET_FETCH_TIMEOUT)
         .connect_timeout(NET_FETCH_CONNECT_TIMEOUT)
         // redirect を自動追従させると次ホップで SSRF ガードを迂回されるため
         // 拒否。プラグインが必要なら 3xx を見て手動で再 fetch する設計。
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    // 事前解決した IP を pin し、reqwest が再 DNS を引かないようにする
+    // (DNS rebinding window をさらに狭める; Codex #5 P1)。
+    for addr in &resolved {
+        client_builder = client_builder.resolve(host, *addr);
+    }
+    let client = client_builder
         .build()
         .map_err(|e| DispatchError::Upstream(format!("reqwest build: {e}")))?;
     let mut builder = client.request(method, parsed.as_str());

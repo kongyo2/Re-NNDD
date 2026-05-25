@@ -241,6 +241,11 @@ pub fn uninstall(plugins_root: &Path, plugin_id: &str) -> Result<(), InstallErro
     Ok(())
 }
 
+/// manifest.json は通常 数百バイト〜数 KB。zip-bomb で manifest.json だけ
+/// 巨大に膨らませる攻撃 (Codex #5 P2) を防ぐため、entry 抽出時と同じく
+/// 明示的に take(MAX+1) で読み切り、超過したら拒否する。
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
 fn read_manifest_text<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
 ) -> Result<String, InstallError> {
@@ -249,9 +254,19 @@ fn read_manifest_text<R: Read + std::io::Seek>(
         Err(zip::result::ZipError::FileNotFound) => return Err(InstallError::ManifestMissing),
         Err(e) => return Err(InstallError::Zip(e)),
     };
-    let mut s = String::new();
-    file.read_to_string(&mut s)?;
-    Ok(s)
+    let mut bytes = Vec::with_capacity(4096);
+    let mut limited = std::io::Read::take(file.by_ref(), MAX_MANIFEST_BYTES + 1);
+    std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(InstallError::SizeLimit {
+            reason: format!("manifest.json exceeded {MAX_MANIFEST_BYTES} bytes"),
+        });
+    }
+    String::from_utf8(bytes).map_err(|e| {
+        InstallError::Manifest(crate::plugins::manifest::ManifestError::Parse(format!(
+            "manifest.json is not valid UTF-8: {e}"
+        )))
+    })
 }
 
 fn safe_relative_path(file: &zip::read::ZipFile<'_>) -> Result<PathBuf, InstallError> {

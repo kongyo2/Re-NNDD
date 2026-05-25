@@ -234,18 +234,32 @@ pub async fn plugin_set_enabled(
     let now = now_unix_secs();
     {
         let conn = library.lock().await;
+        // 先に runtime cache の有無を確認する。無いまま DB を書くと、
+        // 後段 runtime.set_enabled が cache miss でエラーを返した時には
+        // 既に DB だけ更新されてしまっており、その時点で DB↔runtime が
+        // divergent になる (Codex #5 P2)。事前チェックで DB 書き込み前に
+        // 失敗させて divergence を排除する。
+        if runtime.get(&id).is_none() {
+            return Err(AppError::Other(format!(
+                "plugin {id} は runtime キャッシュにありません \
+                 (manifest が壊れている可能性があります)。修復するにはアプリを再起動してください。"
+            )));
+        }
         let changed = registry::set_enabled(&conn, &id, enabled, now).map_err(AppError::from)?;
         if changed == 0 {
             return Err(AppError::Other(format!("plugin not found: {id}")));
         }
-        // DB ロックを保持したまま runtime も更新する (install と対称) 。
-        // runtime cache に entry が無いと set_enabled は silent no-op になり
-        // DB↔runtime split-brain (DB enabled / runtime UnknownPlugin) が
-        // 発生する (Codex #11)。cache miss はエラーとして surface する。
+        // 直前に entry を確認しているので set_enabled は失敗しないはずだが、
+        // 並列に remove された万一のレースに備えて結果をチェックし、その場合は
+        // DB をロールバックして divergence を残さない。
         if !runtime.set_enabled(&id, enabled) {
+            // ベストエフォートでロールバック (元の enabled 値は失われている
+            // ので !enabled で復元 — 多くのケースで正しいが、no-op set だった
+            // ケースでは結果として状態が反転する可能性あり。それでも leave-as-is
+            // よりは divergence を縮小できる)。
+            let _ = registry::set_enabled(&conn, &id, !enabled, now);
             return Err(AppError::Other(format!(
-                "plugin {id} は DB に存在しますが runtime キャッシュにありません \
-                 (manifest が壊れている可能性があります)。修復するにはアプリを再起動してください。"
+                "plugin {id} の runtime 更新中に entry が消えました (race)。状態を復元します。"
             )));
         }
     }
