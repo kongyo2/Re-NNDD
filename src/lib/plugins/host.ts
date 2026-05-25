@@ -83,10 +83,15 @@ export async function enablePlugin(info: import('./types').PluginInfo): Promise<
   await loader.loadPlugin({ ...info, enabled: true });
 }
 
-/** プラグインを無効化 (アンロード + DB)。 */
+/** プラグインを無効化 (DB 永続化 → アンロード)。
+ *  DB 書き込みが失敗した場合に in-memory だけアンロードされて DB と乖離する
+ *  のを防ぐため、DB を先に成功させる (Codex review r3297535052)。
+ *  pluginSetEnabled が throw すると unloadPlugin は呼ばれず例外が再送される
+ *  ので、呼出側 (settings UI) は plugin の状態が変わっていないことを前提に
+ *  リトライできる。 */
 export async function disablePlugin(pluginId: string): Promise<void> {
-  await loader.unloadPlugin(pluginId);
   await pluginSetEnabled(pluginId, false);
+  await loader.unloadPlugin(pluginId);
 }
 
 /** テスト用: bootstrap フラグを reset。 */

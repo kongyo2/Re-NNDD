@@ -100,7 +100,9 @@ function buildContext(info: PluginInfo): PluginContext {
   };
 }
 
-/** プラグインを動的 import して `activate()` を呼ぶ。失敗しても throw しない。 */
+/** プラグインを動的 import して `activate()` を呼ぶ。失敗しても throw しない。
+ *  activate が途中で throw した場合は、それまでに register された全寄与を
+ *  ロールバックしてから failed 状態を記録する (Codex review r3297535055)。 */
 export async function loadPlugin(info: PluginInfo): Promise<void> {
   const pid = info.pluginId;
   try {
@@ -114,6 +116,12 @@ export async function loadPlugin(info: PluginInfo): Promise<void> {
     loadStates.set(pid, { state: 'loaded' });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    // activate 途中で throw すると、既に addNav/addAction/on などで登録した
+    // 寄与だけが残って UI に "幽霊" のように現れる可能性がある。失敗時は
+    // 必ず全寄与を取り消す。
+    registry.removeAllByPlugin(pid);
+    bus.offAllByOwner(pid);
+    loadedModules.delete(pid);
     loadStates.set(pid, { state: 'failed', error: msg });
     console.error(`[plugin] failed to load ${pid}:`, e);
   }

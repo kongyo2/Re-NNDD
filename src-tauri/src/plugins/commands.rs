@@ -185,15 +185,21 @@ pub async fn plugin_uninstall(
     runtime: State<'_, Arc<PluginRuntime>>,
 ) -> Result<()> {
     let root = plugins_root(&app)?;
-    // 1) ファイル先 (UnsafePath なら拒否される — install 時の id を信頼するが二重防御)
-    installer::uninstall(&root, &id).map_err(|e| AppError::Other(format!("uninstall fs: {e}")))?;
-    // 2) DB
+    // 1) DB を canonical として先に削除する。これが失敗した場合は何もしないで
+    //    エラーを返す → ファイルも runtime も無変更で、ユーザは安全に retry できる
+    //    (Codex review r3297535066: DB と FS の divergence 防止)。
     {
         let conn = library.lock().await;
         registry::delete(&conn, &id).map_err(AppError::from)?;
     }
-    // 3) in-memory
+    // 2) in-memory runtime (DB が canonical なので順番依存無し; 落ちないので無条件)
     runtime.remove(&id);
+    // 3) ファイル削除は best-effort。失敗してもログするのみで Ok を返す。
+    //    DB が無いので次回起動から見えなくなる; 残ったディレクトリは次回 install
+    //    時に上書き対象になる (replace フラグなしでも install されないので無害)。
+    if let Err(e) = installer::uninstall(&root, &id) {
+        tracing::warn!(plugin_id = %id, error = %e, "plugin uninstall: leftover files (DB row already removed)");
+    }
     Ok(())
 }
 

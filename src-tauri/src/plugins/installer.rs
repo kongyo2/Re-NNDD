@@ -12,8 +12,20 @@
 
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::plugins::manifest::{ManifestError, PluginManifest};
+
+/// プロセス内で衝突しない tmp/backup ディレクトリ名を作るためのカウンタ。
+/// 同一プラグイン ID を同時に並列インストールしようとしたとき、片方の
+/// `remove_dir_all` がもう片方の展開中ディレクトリを巻き込まないよう、
+/// pid だけでなくこの値も name に含める (Codex review r3297535062)。
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_suffix() -> String {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{n}", std::process::id())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -61,12 +73,14 @@ pub fn install_from_zip_bytes(
     let manifest_text = read_manifest_text(&mut archive)?;
     let manifest = PluginManifest::parse_and_validate(&manifest_text, Some(app_version))?;
 
-    // entry がアーカイブに存在することを確認
+    // entry がアーカイブに存在することを確認。ディレクトリ entry は
+    // 動的 import の対象にならないので非ディレクトリのみを受け付ける
+    // (Codex review r3297535041)。
     let mut has_entry = false;
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
         let safe = safe_relative_path(&file)?;
-        if safe.to_string_lossy() == manifest.entry {
+        if !file.is_dir() && safe.to_string_lossy() == manifest.entry {
             has_entry = true;
             break;
         }
@@ -84,7 +98,10 @@ pub fn install_from_zip_bytes(
 
     // ① まず tmp に全部展開する (target には触らない)。展開途中で zip 破損
     //   や IO エラーが出ても、既存のプラグインは無傷で残る (Codex review #3)。
-    let tmp = plugins_root.join(format!("{}.tmp-{}", manifest.id, std::process::id()));
+    //   tmp / backup には pid + プロセス内カウンタ由来の unique サフィックス
+    //   を付け、同 plugin id への並列 install が互いの作業領域を踏まないようにする。
+    let suffix = unique_suffix();
+    let tmp = plugins_root.join(format!("{}.tmp-{}", manifest.id, suffix));
     if tmp.exists() {
         std::fs::remove_dir_all(&tmp)?;
     }
@@ -117,7 +134,7 @@ pub fn install_from_zip_bytes(
     //   target に rename する。final rename 失敗時は backup を target に
     //   戻して "なかったこと" にする。
     let backup = if target.exists() {
-        let bk = plugins_root.join(format!("{}.bak-{}", manifest.id, std::process::id()));
+        let bk = plugins_root.join(format!("{}.bak-{}", manifest.id, suffix));
         if bk.exists() {
             std::fs::remove_dir_all(&bk)?;
         }
@@ -252,6 +269,29 @@ mod tests {
         let body = zip_with(&[("manifest.json", &manifest_bytes("com.example.x"))]);
         let err = install_from_zip_bytes(tmp.path(), &body, false, "0.1.0").unwrap_err();
         matches!(err, InstallError::EntryMissing { .. });
+    }
+
+    #[test]
+    fn directory_entry_does_not_satisfy_entry_field() {
+        // manifest.entry が "index.js" でも、アーカイブに "index.js" という
+        // ディレクトリしか入っていない場合は EntryMissing で拒否する。動的
+        // import の対象になる実体ファイルが要る (Codex review r3297535041)。
+        let tmp = TempDir::new().unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = zip::write::FileOptions::default();
+            writer.start_file("manifest.json", opts).unwrap();
+            std::io::Write::write_all(&mut writer, &manifest_bytes("com.example.dir")).unwrap();
+            // index.js を **ディレクトリ** として登録
+            writer.add_directory("index.js", opts).unwrap();
+            writer.finish().unwrap();
+        }
+        let err = install_from_zip_bytes(tmp.path(), &buf, false, "0.1.0").unwrap_err();
+        assert!(
+            matches!(err, InstallError::EntryMissing { .. }),
+            "expected EntryMissing, got {err:?}"
+        );
     }
 
     #[test]

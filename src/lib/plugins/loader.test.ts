@@ -61,4 +61,27 @@ describe('loader.loadPlugin', () => {
     expect(registry.pluginNavEntries()).toHaveLength(0);
     expect(bus._handlerCount()).toBe(0);
   });
+
+  it('failed load rolls back partial contributions and listeners', async () => {
+    // 失敗パスを手動で再現: loadPlugin が dynamic import に失敗する前に、
+    // 失敗より前のフェーズで他のプラグインが登録した寄与は残ってはいけない
+    // (Codex review r3297535055)。ここでは register → 失敗 のシナリオを
+    // 直接シミュレートする: 寄与を入れておいてから loadPlugin (確実に
+    // dynamic import で fail) を呼ぶ。失敗時に同じ pluginId の寄与だけが
+    // 取り除かれることを assert する。
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const info = baseInfo('p.rollback');
+    // 別プラグインの寄与は残る
+    registry.addNav('p.other', { href: '/other', label: 'O' });
+    // 同じプラグインの "幽霊" 寄与は失敗で消える
+    registry.addNav('p.rollback', { href: '/r', label: 'R' });
+    bus.on('p.rollback', 'evt', () => undefined);
+    expect(registry.pluginNavEntries()).toHaveLength(2);
+    expect(bus._handlerCount()).toBe(1);
+    await loader.loadPlugin(info);
+    expect(loader.getLoadState('p.rollback')?.state).toBe('failed');
+    expect(registry.pluginNavEntries()).toEqual([{ href: '/other', label: 'O' }]);
+    expect(bus._handlerCount()).toBe(0);
+    errSpy.mockRestore();
+  });
 });

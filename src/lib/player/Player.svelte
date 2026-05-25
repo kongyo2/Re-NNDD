@@ -962,38 +962,40 @@
 
   onMount(() => {
     document.addEventListener('webkitfullscreenchange', onFullscreenChange);
-    // compact (PiP) モードでは window レベルのショートカットを登録しない。
-    // ミニ側と通常ページ側の <Player> が同時に存在する状況で 1 キーが
-    // 2 重発火するのを防ぐ。ミニ側専用のショートカットは MiniPlayer が
-    // 別途登録する。
-    let unbindShortcuts: (() => void) | null = null;
-    if (!compact) {
-      // プラグインの key 要求を Record<key, handler> に畳む。組込みショートカット
-      // 優先 (shortcuts.ts 側 switch の default 節で検証) なので、安全に append できる。
-      const pluginKeys: Record<string, () => void> = {};
-      for (const a of pluginPlayerActions()) {
-        if (a.key) pluginKeys[a.key] = () => void a.handler();
-      }
-      const actions: PlayerActions = {
-        togglePlay,
-        seekDelta,
-        jumpToFraction,
-        toggleComments,
-        toggleFullscreen,
-        toggleMute,
-        setAbIn,
-        setAbOut,
-        toggleAbLoop,
-        volumeDelta: (d) => setVolume((video?.volume ?? volume) + d),
-        frameStep,
-        togglePip: onTogglePip ? () => onTogglePip?.() : undefined,
-        pluginKeys: Object.keys(pluginKeys).length > 0 ? pluginKeys : undefined,
-      };
-      unbindShortcuts = bindShortcuts(window, actions);
-    }
     return () => {
       document.removeEventListener('webkitfullscreenchange', onFullscreenChange);
-      unbindShortcuts?.();
+    };
+  });
+
+  // ショートカット登録は $effect に分離し、pluginPlayerActions() の変化を
+  // 追跡して再バインドする (Codex review r3297535044: プラグインホストが
+  // 非同期に register するので onMount スナップショットだと key が永遠に
+  // 効かないケースを救済)。compact (PiP) モードでは登録しない。
+  $effect(() => {
+    if (compact) return;
+    // 依存源: pluginPlayerActions() の戻り値 (registry 変化に reactive)
+    const pluginKeys: Record<string, () => void> = {};
+    for (const a of pluginPlayerActions()) {
+      if (a.key) pluginKeys[a.key] = () => void a.handler();
+    }
+    const actions: PlayerActions = {
+      togglePlay,
+      seekDelta,
+      jumpToFraction,
+      toggleComments,
+      toggleFullscreen,
+      toggleMute,
+      setAbIn,
+      setAbOut,
+      toggleAbLoop,
+      volumeDelta: (d) => setVolume((video?.volume ?? volume) + d),
+      frameStep,
+      togglePip: onTogglePip ? () => onTogglePip?.() : undefined,
+      pluginKeys: Object.keys(pluginKeys).length > 0 ? pluginKeys : undefined,
+    };
+    const unbindShortcuts = bindShortcuts(window, actions);
+    return () => {
+      unbindShortcuts();
     };
   });
 

@@ -24,10 +24,19 @@
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
   let tagsList = $derived(hit.tags ? hit.tags.split(/\s+/).filter(Boolean) : []);
-  // プラグインが addAction で寄与したメニュー項目。appliesTo を満たすもののみ
-  // 描画する。プラグイン寄与 0 件のとき [] になり、DOM は導入前と同一。
+  // プラグインが addAction で寄与したメニュー項目。appliesTo は third-party
+  // コードなので **必ず try/catch** で囲む — throw が derived 評価を貫いて
+  // カード全体のレンダリングを壊さないようにする (Codex review r3297535047)。
   let pluginActionsForHit = $derived(
-    pluginItemActions().filter((a) => (a.appliesTo ? a.appliesTo(hit) : true)),
+    pluginItemActions().filter((a) => {
+      if (!a.appliesTo) return true;
+      try {
+        return !!a.appliesTo(hit);
+      } catch (e) {
+        console.error('[plugin item action] appliesTo threw — excluding:', e);
+        return false;
+      }
+    }),
   );
   async function runPluginAction(action: ReturnType<typeof pluginItemActions>[number]) {
     try {
