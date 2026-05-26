@@ -11,6 +11,9 @@
   import { extractOnlineFrame, extractVideoFrame } from '$lib/api';
   import { getBool, getNum } from '$lib/stores/settings.svelte';
   import { readSavedMuted, readSavedVolume, saveMuted, saveVolume } from './volumePersistence';
+  import * as pluginBus from '$lib/plugins/eventBus';
+  import { pluginPlayerActions } from '$lib/plugins/registry';
+  import { clearPlayerState, updatePlayerState } from '$lib/plugins/playerState.svelte';
 
   type Props = {
     /** HLS playlist URL（ストリーミング用）。`localSrc` を渡すならこちらは空文字でよい */
@@ -772,6 +775,8 @@
       paused = true;
       showControls();
       onEndedExternal?.();
+      // プラグイン: 動画自然終了 (loop 中は除く)
+      pluginBus.emit('player:ended', { videoId });
     }
   }
 
@@ -786,6 +791,8 @@
     lastTimeUpdateTs = now;
     currentTime = video.currentTime;
     onTime?.(video.currentTime);
+    // プラグイン: 再生時刻更新 (既存 200ms スロットルに乗る)
+    pluginBus.emit('player:time', { videoId, currentTime: video.currentTime });
     maybeCorrectDrift();
     if (
       abLoop.enabled &&
@@ -858,11 +865,25 @@
       audioHandoffSignaled = true;
       onReadyForAudio?.();
     }
+    // プラグイン: 再生開始
+    if (video) {
+      pluginBus.emit('player:play', { videoId, currentTime: video.currentTime });
+    }
   }
   function onPlayState() {
     if (!video) return;
     paused = video.paused;
-    if (video.paused) showControls();
+    if (video.paused) {
+      showControls();
+      // プラグイン: 一時停止 (再生開始は onPlaying 側で emit する)。
+      // 自然終了 (video.ended=true) のときは HTMLMediaElement 仕様で
+      // pause が ended 直前に出るが、ここで emit すると plugin が
+      // "ユーザ pause" と "自然終了" を区別できなくなる
+      // (Codex #15: docs/plugins.md は ended と排他と明記)。
+      if (!video.ended) {
+        pluginBus.emit('player:pause', { videoId, currentTime: video.currentTime });
+      }
+    }
     syncAudioPlayState();
     // 再生開始 = 一過性 error は無視
     if (!video.paused) {
@@ -948,31 +969,102 @@
 
   onMount(() => {
     document.addEventListener('webkitfullscreenchange', onFullscreenChange);
-    // compact (PiP) モードでは window レベルのショートカットを登録しない。
-    // ミニ側と通常ページ側の <Player> が同時に存在する状況で 1 キーが
-    // 2 重発火するのを防ぐ。ミニ側専用のショートカットは MiniPlayer が
-    // 別途登録する。
-    let unbindShortcuts: (() => void) | null = null;
-    if (!compact) {
-      const actions: PlayerActions = {
-        togglePlay,
-        seekDelta,
-        jumpToFraction,
-        toggleComments,
-        toggleFullscreen,
-        toggleMute,
-        setAbIn,
-        setAbOut,
-        toggleAbLoop,
-        volumeDelta: (d) => setVolume((video?.volume ?? volume) + d),
-        frameStep,
-        togglePip: onTogglePip ? () => onTogglePip?.() : undefined,
-      };
-      unbindShortcuts = bindShortcuts(window, actions);
-    }
+    // プラグイン: player.command (Rust dispatcher 経由) を受け取ってプレイヤー
+    // を操作する。compact (PiP) インスタンスでは ignore (重複操作を避ける)。
+    // owner は host 固有。複数インスタンス mount 時には個別 owner で分離する。
+    const PLAYER_BUS_OWNER = compact ? '__host_player_compact__' : '__host_player_main__';
+    const offControl = pluginBus.on(PLAYER_BUS_OWNER, 'plugin:player:control', (payload) => {
+      if (compact) return; // PiP は受け付けない (ページ側 Player が hosts)
+      const p = payload as { kind?: string; value?: number | null } | null;
+      if (!p || typeof p.kind !== 'string') return;
+      try {
+        switch (p.kind) {
+          case 'play':
+            if (video) void video.play().catch(() => undefined);
+            return;
+          case 'pause':
+            video?.pause();
+            return;
+          case 'toggle':
+            togglePlay();
+            return;
+          case 'seek':
+            if (typeof p.value === 'number' && Number.isFinite(p.value)) {
+              seekTo(p.value);
+            }
+            return;
+          case 'setRate':
+            if (typeof p.value === 'number' && Number.isFinite(p.value) && video) {
+              video.playbackRate = Math.max(0.25, Math.min(4, p.value));
+            }
+            return;
+          case 'setVolume':
+            if (typeof p.value === 'number' && Number.isFinite(p.value)) {
+              setVolume(Math.max(0, Math.min(1, p.value)));
+            }
+            return;
+          case 'toggleMute':
+            toggleMute();
+            return;
+        }
+      } catch (e) {
+        console.error('[plugin] player.command handler failed:', e);
+      }
+    });
     return () => {
       document.removeEventListener('webkitfullscreenchange', onFullscreenChange);
-      unbindShortcuts?.();
+      offControl();
+      // PiP は state を持たないので main のときだけ clear。
+      if (!compact) clearPlayerState();
+    };
+  });
+
+  // プラグインから観測可能な状態スナップショットを同期更新する。
+  // ここは Svelte の $effect でリアクティブに反映 — `videoId`/再生時刻/音量/
+  // 一時停止/速度/ミュートが変わったら都度書き込む。compact では state を
+  // 上書きしない (main が真値; PiP は一時的なミラー)。
+  $effect(() => {
+    if (compact) return;
+    updatePlayerState({
+      videoId: videoId ?? null,
+      currentTime,
+      duration,
+      paused,
+      volume,
+      muted,
+      playbackRate,
+    });
+  });
+
+  // ショートカット登録は $effect に分離し、pluginPlayerActions() の変化を
+  // 追跡して再バインドする (Codex review r3297535044: プラグインホストが
+  // 非同期に register するので onMount スナップショットだと key が永遠に
+  // 効かないケースを救済)。compact (PiP) モードでは登録しない。
+  $effect(() => {
+    if (compact) return;
+    // 依存源: pluginPlayerActions() の戻り値 (registry 変化に reactive)
+    const pluginKeys: Record<string, () => void> = {};
+    for (const a of pluginPlayerActions()) {
+      if (a.key) pluginKeys[a.key] = () => void a.handler();
+    }
+    const actions: PlayerActions = {
+      togglePlay,
+      seekDelta,
+      jumpToFraction,
+      toggleComments,
+      toggleFullscreen,
+      toggleMute,
+      setAbIn,
+      setAbOut,
+      toggleAbLoop,
+      volumeDelta: (d) => setVolume((video?.volume ?? volume) + d),
+      frameStep,
+      togglePip: onTogglePip ? () => onTogglePip?.() : undefined,
+      pluginKeys: Object.keys(pluginKeys).length > 0 ? pluginKeys : undefined,
+    };
+    const unbindShortcuts = bindShortcuts(window, actions);
+    return () => {
+      unbindShortcuts();
     };
   });
 
@@ -1138,6 +1230,7 @@
         onFullscreen={toggleFullscreen}
         onQuality={setQuality}
         onTogglePip={() => onTogglePip?.()}
+        pluginActions={pluginPlayerActions()}
       />
     </div>
   {/if}
