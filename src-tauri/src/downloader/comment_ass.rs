@@ -533,7 +533,7 @@ fn is_fullwidth(code: u32) -> bool {
 
 // ── フォントメトリクス (本家 niconico.ts を移植) ────────────────────────
 
-/// getCharSize(size): 384 / doubleResized[size] (683 ステージ pre-scale)。
+/// getCharSize(size): `384 / doubleResized[size]` (683 ステージ pre-scale)。
 fn char_size_ps(size: Size) -> f64 {
     STAGE_HEIGHT / double_resized(size)
 }
@@ -926,10 +926,7 @@ fn font_name_for(font: Font, opts: &AssOptions) -> (String, bool) {
 }
 
 /// 1 コメント分の Dialogue 行 (複数行コメントは行ごとに 1 イベント) を push する。
-#[allow(clippy::too_many_arguments)]
 fn emit_comment(events: &mut String, g: &Geom, opts: &AssOptions, user_opacity: f64) {
-    let line_count = g.lines.len().max(1);
-
     // 不透明度 (ユーザ × コメント)。
     let eff = (user_opacity * g.opacity).clamp(0.0, 1.0);
     let fill_a = alpha_hex(eff);
@@ -972,7 +969,6 @@ fn emit_comment(events: &mut String, g: &Geom, opts: &AssOptions, user_opacity: 
             let x2 = pos_x(g, end_sec * 100.0);
             for (k, line) in g.lines.iter().enumerate() {
                 let yc = g.pos_y + g.char_1920 / 2.0 + g.line_1920 * k as f64;
-                let _ = line_count;
                 events.push_str(&format!(
                     "Dialogue: 0,{st},{en},nnd,,0,0,0,,{{{common}\\move({x1},{y},{x2},{y})}}{txt}\n",
                     st = fmt_time(start_sec),

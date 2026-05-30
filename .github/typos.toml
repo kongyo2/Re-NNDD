@@ -47,3 +47,6 @@ UE = "UE"
 # ASS (Advanced SubStation Alpha) 字幕フォーマットのフィールド名。
 # `PrimaryColour` 等は英国式綴りが仕様で必須。
 Colour = "Colour"
+# ASS override タグ `\bord` (縁取り幅)。コメント焼き込みで使う仕様語。
+# typos は "border"/"board" を提案するが ASS 仕様語なので変更不可。
+bord = "bord"
