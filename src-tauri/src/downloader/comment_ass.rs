@@ -442,49 +442,53 @@ fn parse_nico_color_alpha(v: &str) -> Option<(u32, f64)> {
 
 // ── 文字幅計測 (本家は canvas measureText、ここは近似テーブル) ────────────
 
-/// 半角 ASCII (0x20..0x7E) の送り幅 (em=1000 単位)。Helvetica/Arial メトリクスを
-/// 基準にした近似。CJK ゴシックの欧文部とも libass のサンセリフとも概ね合う。
+/// 半角 ASCII (0x20..0x7E) の送り幅 (em=1000 単位)。
+///
+/// 既定フォント "Noto Sans CJK JP" を **weight 600** (本家 defont 相当) で実測した値
+/// (node-canvas measureText)。本家 niconicomments を同フォントで構成したときの幅計測と
+/// 一致し、libass の Noto CJK Bold 描画とも揃う。全角は別途 1em 扱い。
+/// 実測ハーネス: `niconicomments` を headless 実行して height/posY/width をクロス検証。
 const ASCII_ADVANCE: [u16; 95] = [
-    278, // ' '
-    278, // !
-    355, // "
-    556, // #
-    556, // $
-    889, // %
-    667, // &
-    191, // '
-    333, // (
-    333, // )
-    389, // *
-    584, // +
-    278, // ,
-    333, // -
-    278, // .
-    278, // /
-    556, 556, 556, 556, 556, 556, 556, 556, 556, 556,  // 0-9
-    278,  // :
-    278,  // ;
-    584,  // <
-    584,  // =
-    584,  // >
-    556,  // ?
-    1015, // @
-    667, 667, 722, 722, 667, 611, 778, 722, 278, 500, // A-J
-    667, 556, 833, 722, 778, 667, 778, 722, 667, 611, // K-T
-    722, 667, 944, 667, 667, 611, // U-Z
-    278, // [
-    278, // backslash
-    278, // ]
-    469, // ^
-    556, // _
-    333, // `
-    556, 556, 500, 556, 556, 278, 556, 556, 222, 222, // a-j
-    500, 222, 833, 556, 556, 556, 556, 333, 500, 278, // k-t
-    556, 500, 722, 500, 500, 500, // u-z
-    334, // {
-    260, // |
-    334, // }
-    584, // ~
+    227, // ' '
+    370, // !
+    574, // "
+    590, // #
+    590, // $
+    963, // %
+    740, // &
+    325, // '
+    378, // (
+    378, // )
+    507, // *
+    590, // +
+    325, // ,
+    370, // -
+    325, // .
+    387, // /
+    590, 590, 590, 590, 590, 590, 590, 590, 590, 590,  // 0-9
+    325,  // :
+    325,  // ;
+    590,  // <
+    590,  // =
+    590,  // >
+    514,  // ?
+    1007, // @
+    641, 681, 656, 714, 615, 585, 717, 757, 330, 568, // A-J
+    686, 578, 853, 749, 770, 667, 770, 682, 624, 625, // K-T
+    748, 619, 915, 627, 580, 613, // U-Z
+    378, // [
+    387, // backslash
+    378, // ]
+    590, // ^
+    567, // _
+    626, // `
+    591, 644, 527, 644, 581, 372, 597, 640, 304, 306, // a-j
+    604, 315, 964, 641, 626, 644, 644, 436, 495, 421, // k-t
+    637, 576, 863, 562, 574, 511, // u-z
+    378, // {
+    296, // |
+    378, // }
+    590, // ~
 ];
 
 /// 1 文字の送り幅 (フォント px に対する比率 em)。本家の canvas 計測の近似。
@@ -1022,13 +1026,10 @@ fn emit_comment(events: &mut String, g: &Geom, opts: &AssOptions, user_opacity: 
     }
 }
 
-/// コメント列から ASS 文字列を生成する。
-///
-/// 本家 niconicomments の HTML5 描画を 1920×1080 空間で再現し、PlayResX/Y も
-/// 1920×1080 に固定する。libass が出力解像度へスケールするので解像度非依存。
-pub fn generate_ass(comments: &[BurnInComment], opts: &AssOptions) -> String {
+/// コメント列を本家アルゴリズムでレイアウトし、各コメントの幾何 (1920 空間,
+/// `pos_y` 確定済み) を返す。`generate_ass` と数値クロス検証テストで共有する。
+fn layout_comments(comments: &[BurnInComment], opts: &AssOptions) -> Vec<Geom> {
     let font_scale = opts.font_scale.clamp(0.1, 8.0);
-    let user_opacity = opts.opacity.clamp(0.0, 1.0);
 
     // vpos 昇順で処理順を安定させる (当たり判定は処理順依存)。本家は入力順だが、
     // DB は vpos 昇順なので概ね一致する。
@@ -1077,6 +1078,17 @@ pub fn generate_ass(comments: &[BurnInComment], opts: &AssOptions) -> String {
             Loc::Shita => register_fixed(idx, &geom, &mut col_shita),
         }
     }
+
+    geom
+}
+
+/// コメント列から ASS 文字列を生成する。
+///
+/// 本家 niconicomments の HTML5 描画を 1920×1080 空間で再現し、PlayResX/Y も
+/// 1920×1080 に固定する。libass が出力解像度へスケールするので解像度非依存。
+pub fn generate_ass(comments: &[BurnInComment], opts: &AssOptions) -> String {
+    let user_opacity = opts.opacity.clamp(0.0, 1.0);
+    let geom = layout_comments(comments, opts);
 
     // Dialogue 生成。
     let mut events = String::new();
@@ -1651,6 +1663,76 @@ mod tests {
         assert_eq!(s_naka.long, None); // build_geom で 300cs になる
         let s_ue = parse_style(&["ue".into()], "x", &o);
         assert_eq!(s_ue.long, Some(600));
+    }
+
+    #[test]
+    fn cross_validates_against_niconicomments_reference() {
+        // 本家 niconicomments (v0.2.78) を node-canvas + Noto Sans CJK JP(weight 600)
+        // で headless 実行して得た width/height/posY との数値クロス検証。
+        // height・固定 posY・CJK 幅は厳密一致、ASCII 幅は整数 em テーブルの丸めで
+        // ±3px 以内。これで「本家と同じ配置・サイズ」を恒久テストとして固定する。
+        let o = AssOptions {
+            width: 1920,
+            height: 1080,
+            duration_sec: 600.0,
+            font_name: "Noto Sans CJK JP".into(),
+            ..AssOptions::default()
+        };
+        let comments = vec![
+            cmt(0, "あ", &[]),
+            cmt(0, "あいうえお", &[]),
+            cmt(0, "big", &["big"]),
+            cmt(0, "small", &["small"]),
+            cmt(0, "WWWWW", &[]),
+            cmt(0, "iiiii", &[]),
+            cmt(0, "a\nb\nc", &[]),
+            cmt(0, "a\nb\nc\nd\ne", &[]),
+            cmt(100, "ue1", &["ue"]),
+            cmt(100, "ue2", &["ue"]),
+            cmt(100, "ue3", &["ue"]),
+            cmt(100, "shita1", &["shita"]),
+            cmt(100, "shita2", &["shita"]),
+        ];
+        let geom = layout_comments(&comments, &o);
+        let find = |content: &str| {
+            geom.iter()
+                .find(|g| g.lines.join("\n") == content)
+                .expect("geom for test content not found")
+        };
+        // (content, 本家 width, height, posY, width 許容差)
+        let expected: &[(&str, f64, f64, f64, f64)] = &[
+            ("あ", 75.9, 95.53, 0.0, 0.6),
+            ("あいうえお", 379.5, 95.53, 95.53, 0.6),
+            ("big", 171.48, 138.39, 191.06, 3.0),
+            ("small", 137.75, 65.03, 329.45, 3.0),
+            ("WWWWW", 348.58, 95.53, 394.48, 3.0),
+            ("iiiii", 118.07, 95.53, 490.01, 3.0),
+            ("a\nb\nc", 50.6, 258.16, 585.54, 3.0),
+            ("a\nb\nc\nd\ne", 28.11, 218.49, 843.7, 3.0),
+            ("ue1", 137.75, 95.53, 0.0, 3.0),
+            ("ue2", 137.75, 95.53, 95.53, 3.0),
+            ("ue3", 137.75, 95.53, 191.06, 3.0),
+            ("shita1", 230.51, 95.53, 0.0, 3.0),
+            ("shita2", 230.51, 95.53, 95.53, 3.0),
+        ];
+        for (content, w, h, py, wtol) in expected {
+            let g = find(content);
+            assert!(
+                (g.height - h).abs() < 0.1,
+                "{content}: height {} vs ref {h}",
+                g.height
+            );
+            assert!(
+                (g.pos_y - py).abs() < 0.1,
+                "{content}: posY {} vs ref {py}",
+                g.pos_y
+            );
+            assert!(
+                (g.width - w).abs() < *wtol,
+                "{content}: width {} vs ref {w}",
+                g.width
+            );
+        }
     }
 
     #[test]
