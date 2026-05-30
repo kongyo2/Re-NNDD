@@ -63,6 +63,11 @@ const STROKE_OPACITY: f64 = 0.4;
 const MIN_FONT_SIZE: f64 = 10.0;
 /// コメント既定の長さ (vpos=センチ秒; 本家 long 既定 300 = 3 秒)。
 const DEFAULT_LONG_CS: i64 = 300;
+/// コメント長さの上限 (vpos=センチ秒, 60 秒)。`@N` は本家・niconicomments とも
+/// 無制限だが、当たり判定は vpos スロット単位で long 回ループするため、巨大な
+/// `@1000000` 等を受けると `generate_ass` が暴走・OOM する。実コメントは数秒
+/// 程度なので 60 秒で頭打ちにしても見た目に影響しない (DoS 対策)。
+const MAX_LONG_CS: i64 = 6000;
 
 /// 各サイズの doubleResized 行数 (本家 html5LineCounts.doubleResized)。
 fn double_resized(size: Size) -> f64 {
@@ -316,10 +321,14 @@ fn parse_style(commands: &[String], content: &str, opts: &AssOptions) -> ParsedS
         if lower.starts_with("nico:fill:") || lower.starts_with("nico:waku:") {
             continue;
         }
-        // @N (長さ)
+        // @N (長さ)。NaN/Inf/負値を弾き、上限でクランプしてから格納する
+        // (巨大な @N で当たり判定ループが暴走するのを防ぐ; DoS 対策)。
         if let Some(rest) = lower.strip_prefix('@') {
             if let Ok(v) = rest.parse::<f64>() {
-                long = Some((v * 100.0).floor() as i64);
+                if v.is_finite() && v > 0.0 {
+                    let cs = (v * 100.0).floor().clamp(1.0, MAX_LONG_CS as f64);
+                    long = Some(cs as i64);
+                }
             }
             continue;
         }
@@ -652,7 +661,9 @@ fn build_geom(
     Geom {
         index,
         vpos,
-        long: style.long.unwrap_or(DEFAULT_LONG_CS).max(1),
+        // 全経路 (@N / fixed_duration 既定 / 直接指定) の最終クランプ。
+        // 当たり判定ループが long 回まわるため上限を必ず効かせる (DoS 対策)。
+        long: style.long.unwrap_or(DEFAULT_LONG_CS).clamp(1, MAX_LONG_CS),
         loc: style.loc,
         owner,
         rgb: style.rgb,
@@ -1243,6 +1254,22 @@ mod tests {
     fn parse_long_command() {
         let s = parse_style(&["@5".into()], "x", &opts());
         assert_eq!(s.long, Some(500));
+    }
+
+    #[test]
+    fn huge_or_invalid_at_command_is_bounded() {
+        // 巨大な @N は上限でクランプ (当たり判定ループ暴走/OOM を防ぐ; DoS 対策)。
+        assert_eq!(
+            parse_style(&["@1000000".into()], "x", &opts()).long,
+            Some(MAX_LONG_CS)
+        );
+        // 非有限・非正値は無視して既定へフォールバック。
+        assert_eq!(parse_style(&["@inf".into()], "x", &opts()).long, None);
+        assert_eq!(parse_style(&["@nan".into()], "x", &opts()).long, None);
+        assert_eq!(parse_style(&["@-5".into()], "x", &opts()).long, None);
+        // ue + 巨大 @N でも生成が即座に完了する (long がクランプされるため)。
+        let ass = generate_ass(&[cmt(0, "x", &["ue", "@1000000"])], &opts());
+        assert!(ass.contains("Dialogue:"));
     }
 
     #[test]
