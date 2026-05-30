@@ -2720,6 +2720,8 @@ pub async fn export_video_with_comments(
     };
 
     // --- ASS 生成 ---
+    // フォント既定はプレイヤー (CommentLayer) と揃えて CJK ゴシックにする。
+    // libass は fontconfig 経由で実フォントへ解決し、無ければ代替する。
     let ass_opts = AssOptions {
         width,
         height,
@@ -2731,7 +2733,7 @@ pub async fn export_video_with_comments(
         font_name: options
             .font_name
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "sans-serif".to_string()),
+            .unwrap_or_else(|| "Noto Sans CJK JP".to_string()),
     };
     let comment_count = comments.len();
     let ass = generate_ass(&comments, &ass_opts);
