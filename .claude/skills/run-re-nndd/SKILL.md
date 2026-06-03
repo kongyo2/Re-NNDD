@@ -34,7 +34,11 @@ Runtimes: Node 20+ and Rust **stable ≥ 1.96** (see Setup — 1.94 will not bui
 npm install
 
 # Tauri's externalBin requires the sidecar files to physically exist or the
-# build script aborts (even for --no-bundle / clippy / test). Stub them:
+# build script aborts (even for --no-bundle / clippy / test). These are
+# BUILD-TIME stubs only (same trick as CI): the --no-bundle debug binary
+# resolves yt-dlp/ffmpeg from <exe_dir>, <workspace>/binaries, then PATH — it
+# never looks in src-tauri/binaries/ — so the empty stubs are not executed at
+# runtime. For working downloads/exports, fetch real binaries instead (below).
 TRIPLE=$(rustc -vV | awk '/^host:/{print $2}')   # x86_64-unknown-linux-gnu
 mkdir -p src-tauri/binaries
 for n in yt-dlp ffmpeg; do f="src-tauri/binaries/$n-$TRIPLE"; : > "$f"; chmod +x "$f"; done
@@ -48,8 +52,10 @@ rustup update stable
 cargo install tauri-driver --locked
 ```
 
-`yt-dlp` / `ffmpeg` are optional — the app resolves them to "not found" and runs
-fine (only downloads are disabled). For real downloads: `bash scripts/fetch-binaries.sh`.
+`yt-dlp` / `ffmpeg` are optional for the screenshot driver — the app resolves them
+to "not found" and runs fine (only downloads/exports are disabled). Don't rely on
+the build stubs above for real downloads; fetch actual binaries with
+`bash scripts/fetch-binaries.sh` (it overwrites the stubs with working binaries).
 
 ## Build
 

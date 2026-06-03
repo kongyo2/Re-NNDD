@@ -16,6 +16,7 @@
 // Env knobs:
 //   APP_BIN   path to the app binary (default: target/debug/nndd-next)
 //   PORT      tauri-driver port (default: 4444)
+//   NATIVE_PORT  native WebKitWebDriver port tauri-driver proxies to (default: PORT+1)
 //   OUT_DIR   default screenshot dir (default: /tmp/re-nndd-shots)
 //   NO_VITE=1 skip the defensive Vite dev-server launch (pure prod binary)
 //   REUSE_VITE=1 reuse a server already on :1420 instead of failing closed
@@ -29,6 +30,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // skill dir is <repo>/.claude/skills/run-re-nndd -> repo root is 3 up
 const REPO = resolve(HERE, '..', '..', '..');
 const PORT = Number(process.env.PORT || 4444);
+// tauri-driver runs TWO WebDriver ends; if you move PORT off 4444, the native
+// WebKitWebDriver must move off its 4445 default too or it can collide/attach to
+// a stale native driver. Track PORT by default.
+const NATIVE_PORT = Number(process.env.NATIVE_PORT || PORT + 1);
 const BASE = `http://127.0.0.1:${PORT}`;
 // NB: this is a cargo *workspace*, so the binary lands in the workspace-root
 // target/, not src-tauri/target/.
@@ -161,7 +166,14 @@ async function ensureVite() {
     }
     await sleep(400);
   }
-  vite.kill('SIGTERM');
+  // Group kill (negative pid) — Vite is a group leader and may already have
+  // spawned an esbuild child; killing only the parent would orphan it. This
+  // path runs before ensureVite() returns, so main()'s finally can't reap it.
+  try {
+    process.kill(-vite.pid, 'SIGTERM');
+  } catch {
+    vite.kill('SIGTERM');
+  }
   throw new Error(`Vite did not come up on :1420 in 40s (see ${log})`);
 }
 
@@ -178,10 +190,14 @@ async function startDriver() {
   }
   // tauri-driver passes our env (incl. WEBKIT_* software-render flags) down to
   // WebKitWebDriver and the app it launches.
-  const proc = spawn('tauri-driver', ['--port', String(PORT)], {
-    stdio: ['ignore', 'inherit', 'inherit'],
-    env: process.env,
-  });
+  const proc = spawn(
+    'tauri-driver',
+    ['--port', String(PORT), '--native-port', String(NATIVE_PORT)],
+    {
+      stdio: ['ignore', 'inherit', 'inherit'],
+      env: process.env,
+    },
+  );
   // Record the failure instead of process.exit() here: exiting from this async
   // event handler bypasses main()'s finally and would orphan the Vite server
   // ensureVite() started. waitForDriver() sees spawnError and throws, so the
@@ -240,6 +256,20 @@ async function screenshot(sid, file) {
   return file;
 }
 
+// Poll until the webview actually reports the target path. A fixed sleep can
+// fire while the SvelteKit route chunk is still loading (cold Vite / load),
+// which would screenshot the *previous* page under the next route's filename.
+async function waitForPath(sid, route, timeoutMs = 12000) {
+  const t0 = Date.now();
+  let at = '';
+  while (Date.now() - t0 < timeoutMs) {
+    at = await execute(sid, 'return location.pathname;');
+    if (at === route) return;
+    await sleep(150);
+  }
+  throw new Error(`navigation to ${route} did not settle (still at ${at})`);
+}
+
 // Click the sidebar <a> whose href matches, then wait for the URL to settle.
 async function navTo(sid, route) {
   // Prefer clicking the real nav link (exercises SvelteKit client routing).
@@ -249,13 +279,13 @@ async function navTo(sid, route) {
     const href = await wd('GET', `/session/${sid}/element/${eid}/attribute/href`);
     if (href && new URL(href, 'http://x').pathname === route) {
       await elClick(sid, eid);
-      await sleep(500);
+      await waitForPath(sid, route);
       return;
     }
   }
   // Fallback: SvelteKit programmatic navigation.
   await execute(sid, 'window.location.assign(arguments[0]);', [route]);
-  await sleep(700);
+  await waitForPath(sid, route);
 }
 
 async function main() {
@@ -298,7 +328,7 @@ async function main() {
       await sleep(600);
       console.log('wrote', await screenshot(sid, a2));
     } else if (cmd === 'eval') {
-      if (!a1) throw new Error('usage: eval <route> <js>');
+      if (!a1 || !a2) throw new Error('usage: eval <route> <js>');
       await navTo(sid, a1);
       await sleep(600);
       const script = a2 && a2.trim().startsWith('return') ? a2 : `return (${a2});`;
