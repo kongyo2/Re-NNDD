@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import Hls from 'hls.js';
   import type { Level } from 'hls.js';
   import CommentLayer from './CommentLayer.svelte';
@@ -9,7 +9,7 @@
   import { TauriHlsLoader } from './tauriHlsLoader';
   import type { PlayerComment } from './types';
   import { extractOnlineFrame, extractVideoFrame } from '$lib/api';
-  import { getBool, getNum } from '$lib/stores/settings.svelte';
+  import { getBool, getNum, getStr } from '$lib/stores/settings.svelte';
   import { readSavedMuted, readSavedVolume, saveMuted, saveVolume } from './volumePersistence';
   import * as pluginBus from '$lib/plugins/eventBus';
   import { pluginPlayerActions } from '$lib/plugins/registry';
@@ -107,7 +107,12 @@
   let volume = $state(1);
   let muted = $state(false);
   let playbackRate = $state(1);
-  let commentsEnabled = $state(compact || getBool('comment.default_enabled'));
+  // 初期値を一度だけシードする (以降はユーザのトグルが真値)。compact は
+  // インスタンス毎に定数 (MiniPlayer=true / ページ=false) なので untrack で
+  // 「初期値の一回読み」であることを明示し、state_referenced_locally 警告を
+  // 解消する。compact 変化時に commentsEnabled を作り直さない (= ユーザの
+  // 手動トグルを巻き戻さない) のが正しい挙動。
+  let commentsEnabled = $state(untrack(() => compact) || getBool('comment.default_enabled'));
   let commentOpacity = $state(getNum('comment.default_opacity'));
   let abLoop = $state<{ in: number | null; out: number | null; enabled: boolean }>({
     in: null,
@@ -822,8 +827,11 @@
   function onLoadedMetadata() {
     applyPendingSeek();
     if (!video) return;
-    // 設定からデフォルト値を反映
-    const defaultRate = getNum('playback.default_rate');
+    // 設定からデフォルト値を反映。
+    // playback.default_rate は kind='select' なので値は常に文字列 ('1.0' 等)。
+    // getNum はそのまま文字列を返すため Number.isFinite が常に false になり
+    // ユーザが選んだ倍率が無視されていた。Number() で明示的に数値化する。
+    const defaultRate = Number(getStr('playback.default_rate'));
     if (Number.isFinite(defaultRate) && defaultRate > 0) {
       video.playbackRate = defaultRate;
     }

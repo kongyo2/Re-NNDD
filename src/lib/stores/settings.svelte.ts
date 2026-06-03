@@ -87,7 +87,10 @@ export const SETTING_DEFS = [
     label: 'デフォルト再生速度',
     description: '動画を開いた直後の再生倍率',
     section: 'playback',
-    default: 1.0,
+    // select の option value は文字列なので default も文字列で持つ。
+    // 数値 1.0 にすると String(1.0)==='1' となり option value '1.0' と
+    // 一致せず <select> が selectedIndex=-1 (空表示) になる。
+    default: '1.0',
     kind: 'select',
     options: [
       { value: '0.5', label: '0.5x' },

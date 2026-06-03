@@ -22,4 +22,21 @@ describe('SETTING_DEFS (regression guard for plugin system)', () => {
     const keys = SETTING_DEFS.map((d) => d.key);
     expect(new Set(keys).size).toBe(keys.length);
   });
+
+  // select の option value は常に文字列。default が数値だと
+  // <select value={String(default)}> で String(1.0)==='1' となり
+  // option value '1.0' と一致せず selectedIndex=-1 (空表示) になる。
+  // さらに getStr/getNum 経由の消費側も型がズレてユーザ設定が無視される。
+  // (regression: playback.default_rate が default:1.0 で空表示になっていた)
+  it('every select setting default exactly matches one of its option values', () => {
+    for (const def of SETTING_DEFS) {
+      if (def.kind !== 'select') continue;
+      expect(def.options, `${def.key} is select but has no options`).toBeTruthy();
+      const values = (def.options ?? []).map((o) => o.value);
+      // 文字列としての厳密一致を要求する (型違いの 1.0 は弾く)。
+      expect(values, `${def.key} default ${JSON.stringify(def.default)} not in options`).toContain(
+        def.default,
+      );
+    }
+  });
 });
