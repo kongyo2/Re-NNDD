@@ -72,9 +72,17 @@ pub fn list_play_history(
             "WHERE 1=1"
         },
     );
-    let flag = is_short.unwrap_or(false) as i64;
     let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map(params![limit, offset, flag], |row| {
+    // is_short が None のときクエリは ?3 を含まない (WHERE 1=1) ので、flag を
+    // バインドしてはいけない。常に 3 個渡すと None 時に「Wrong number of
+    // parameters passed to query. Got 3, needed 2」で実行が落ちる。プレース
+    // ホルダ数に一致させ、フィルタ指定時のみ ?3 をバインドする。
+    let flag = is_short.map(|s| s as i64);
+    let mut binds: Vec<&dyn rusqlite::types::ToSql> = vec![&limit, &offset];
+    if let Some(ref f) = flag {
+        binds.push(f);
+    }
+    let rows = stmt.query_map(binds.as_slice(), |row| {
         Ok(PlayHistoryItem {
             id: row.get(0)?,
             video_id: row.get(1)?,
@@ -99,4 +107,80 @@ pub fn clear_play_history(conn: &Connection) -> Result<usize, LibraryError> {
 pub fn delete_play_history_item(conn: &Connection, id: i64) -> Result<bool, LibraryError> {
     let affected = conn.execute("DELETE FROM play_history WHERE id = ?1", params![id])?;
     Ok(affected > 0)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::library::schema::run_migrations;
+
+    fn setup() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn).unwrap();
+        conn
+    }
+
+    fn insert_video(conn: &Connection, id: &str, is_short: i64) {
+        conn.execute(
+            "INSERT INTO videos (id, title, duration_sec, is_short) VALUES (?1, ?2, ?3, ?4)",
+            params![id, format!("title {id}"), 100, is_short],
+        )
+        .unwrap();
+    }
+
+    // Regression: is_short=None だとクエリは ?3 を含まない (WHERE 1=1) のに、
+    // 以前は常に 3 個 (limit/offset/flag) をバインドしていたため
+    // 「Wrong number of parameters passed to query. Got 3, needed 2」で
+    // 既定の履歴一覧 (フィルタ無し) が必ず落ちていた。
+    #[test]
+    fn list_play_history_without_filter_does_not_error() {
+        let conn = setup();
+        insert_video(&conn, "sm9", 0);
+        record_playback(&conn, "sm9", 42.0, Some(42.0)).unwrap();
+
+        let all = list_play_history(&conn, 0, 50, None).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].video_id, "sm9");
+        assert_eq!(all[0].duration_played_sec, 42.0);
+        assert_eq!(all[0].position_at_close_sec, Some(42.0));
+    }
+
+    // フィルタ指定時 (?3 あり) も正しく動き、ショート / 非ショートを出し分ける。
+    #[test]
+    fn list_play_history_respects_is_short_filter() {
+        let conn = setup();
+        insert_video(&conn, "sm9", 0);
+        insert_video(&conn, "ss1", 1);
+        record_playback(&conn, "sm9", 1.0, None).unwrap();
+        record_playback(&conn, "ss1", 1.0, None).unwrap();
+
+        let shorts = list_play_history(&conn, 0, 50, Some(true)).unwrap();
+        assert_eq!(shorts.len(), 1);
+        assert_eq!(shorts[0].video_id, "ss1");
+        assert!(shorts[0].is_short);
+
+        let longs = list_play_history(&conn, 0, 50, Some(false)).unwrap();
+        assert_eq!(longs.len(), 1);
+        assert_eq!(longs[0].video_id, "sm9");
+        assert!(!longs[0].is_short);
+
+        let all = list_play_history(&conn, 0, 50, None).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    // record_playback は videos.play_count を増やし last_played_at を更新する。
+    #[test]
+    fn record_playback_increments_play_count() {
+        let conn = setup();
+        insert_video(&conn, "sm9", 0);
+        record_playback(&conn, "sm9", 5.0, None).unwrap();
+        record_playback(&conn, "sm9", 7.0, None).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT play_count FROM videos WHERE id = 'sm9'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+    }
 }
