@@ -46,7 +46,10 @@ Thumbs.db
 
 # Local agent/tool state
 .agents/
-.claude/
+# Ignore local .claude state (settings.local.json, etc.) but keep committed
+# skills tracked — they're shared, discoverable project tooling.
+.claude/*
+!.claude/skills/
 .crush/
 .codex
 CLAUDE.md
