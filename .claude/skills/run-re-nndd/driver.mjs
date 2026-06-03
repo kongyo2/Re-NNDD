@@ -18,6 +18,7 @@
 //   PORT      tauri-driver port (default: 4444)
 //   OUT_DIR   default screenshot dir (default: /tmp/re-nndd-shots)
 //   NO_VITE=1 skip the defensive Vite dev-server launch (pure prod binary)
+//   REUSE_VITE=1 reuse a server already on :1420 instead of failing closed
 
 import { spawn } from 'node:child_process';
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -113,38 +114,34 @@ async function httpUp(url) {
   }
 }
 
-// Confirm a server on :1420 is actually a Vite dev server (it always serves its
-// HMR client module here) — not some unrelated/stale process we'd otherwise
-// screenshot by mistake.
-async function isViteServer() {
-  try {
-    const r = await fetch('http://127.0.0.1:1420/@vite/client', {
-      signal: AbortSignal.timeout(1500),
-    });
-    return r.ok && (r.headers.get('content-type') || '').includes('javascript');
-  } catch {
-    return false;
-  }
-}
-
 // Tauri *debug* builds default to dev mode and load the Vite devUrl
 // (http://localhost:1420); only `npx tauri build` bakes the frontend in for a
 // prod-style load. A plain `cargo build`/`cargo test` on the workspace silently
 // rebuilds the binary in dev mode -> it then shows "Could not connect to
-// localhost" under the driver. To be robust to BOTH binary flavours we make
-// sure Vite is up before launching: a prod binary ignores it, a dev binary
-// needs it. Set NO_VITE=1 to skip (pure prod binary, slightly faster).
+// localhost" under the driver. To be robust to BOTH binary flavours we start
+// our OWN Vite (from this repo) before launching: a prod binary ignores it, a
+// dev binary loads it. Set NO_VITE=1 to skip (pure prod binary, slightly faster).
 async function ensureVite() {
   if (process.env.NO_VITE) return null;
+  // Fail closed if :1420 is already taken: a dev-mode binary would load whatever
+  // is there (devUrl=localhost:1420), which could be a stale build or a totally
+  // different app/checkout — and we'd silently screenshot the wrong thing. We
+  // can't reliably prove an arbitrary server is *this* checkout, so refuse it.
+  // REUSE_VITE=1 opts in (e.g. you already run `npm run dev` for this repo).
   if (await httpUp('http://127.0.0.1:1420')) {
-    if (await isViteServer()) return null; // reuse the Vite already running
+    if (process.env.REUSE_VITE) {
+      console.log('reusing the server already on :1420 (REUSE_VITE set)');
+      return null;
+    }
     throw new Error(
-      'port 1420 is occupied by a non-Vite server — a dev-mode binary would ' +
-        'load it and screenshot the wrong app. Free :1420, or pass NO_VITE=1 ' +
-        'if you built a prod binary (npx tauri build).',
+      'port 1420 is already in use — a dev-mode binary loads whatever lives ' +
+        'there (devUrl=localhost:1420), which may be a stale or unrelated app, ' +
+        'so screenshots could capture the wrong thing. Free it ' +
+        '(pkill -f node_modules/.bin/vite), or set REUSE_VITE=1 to use it as-is, ' +
+        'or NO_VITE=1 if you built a prod binary (npx tauri build).',
     );
   }
-  console.log('starting Vite dev server for dev-mode binary…');
+  console.log('starting Vite dev server (this repo) for dev-mode binary…');
   const log = '/tmp/re-nndd-vite.log';
   const out = (await import('node:fs')).openSync(log, 'w');
   // Spawn the vite binary directly (NOT `npm run dev`): npm swallows SIGTERM and

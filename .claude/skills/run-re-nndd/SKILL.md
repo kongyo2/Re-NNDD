@@ -89,7 +89,8 @@ xvfb-run -a node .claude/skills/run-re-nndd/driver.mjs eval / 'document.querySel
 ```
 
 Env knobs: `APP_BIN` (binary path), `OUT_DIR`, `PORT` (tauri-driver, default 4444),
-`NO_VITE=1` (skip the defensive Vite launch — see Gotchas).
+`NO_VITE=1` (skip the defensive Vite launch — see Gotchas), `REUSE_VITE=1` (reuse a
+server already on :1420 instead of failing closed).
 
 ## Test
 
@@ -113,10 +114,11 @@ npm run tauri:dev   # Vite + a real window. Useless headless; Ctrl-C to stop.
   `npx tauri build` bakes the frontend in. So after `cargo test --workspace`
   rebuilds `nndd-next`, launching it shows a blank page reading **"Could not
   connect to localhost: Connection refused."** The driver defends against this by
-  auto-starting Vite on :1420 before launching (and verifies an already-running
-  :1420 is actually Vite) — a prod binary ignores it, a dev binary uses it, both
-  render. If you want the pure prod path,
-  rebuild with `npx tauri build --debug --no-bundle` and pass `NO_VITE=1`.
+  starting its own Vite (from this repo) on :1420 before launching — a prod binary
+  ignores it, a dev binary loads it, both render. If :1420 is already occupied it
+  fails closed (it can't prove a stranger's server is this checkout); free it,
+  `REUSE_VITE=1` to use it anyway, or `NO_VITE=1` for a prod binary. For the pure
+  prod path, rebuild with `npx tauri build --debug --no-bundle` and pass `NO_VITE=1`.
 - **WebKitGTK is blank without software-render env vars under Xvfb.** The driver
   exports `WEBKIT_DISABLE_COMPOSITING_MODE=1`, `WEBKIT_DISABLE_DMABUF_RENDERER=1`,
   `LIBGL_ALWAYS_SOFTWARE=1`, `GDK_BACKEND=x11`. If you launch the binary yourself
