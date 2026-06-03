@@ -76,11 +76,11 @@ Output: PNGs in `/tmp/re-nndd-shots/` (`00-home.png` … `08-settings.png`). The
 **look at them** (Read the PNG) — a real render shows the dark sidebar + cards +
 "アプリバージョン 0.1.0" (proves the Tauri IPC reached the live Rust backend).
 
-| command | what it does |
-|---|---|
-| `node driver.mjs tour [outDir]` | screenshot every route → `outDir` (default `/tmp/re-nndd-shots`) |
+| command                               | what it does                                                          |
+| ------------------------------------- | --------------------------------------------------------------------- |
+| `node driver.mjs tour [outDir]`       | screenshot every route → `outDir` (default `/tmp/re-nndd-shots`)      |
 | `node driver.mjs shot <route> <file>` | navigate to one route, write one PNG (e.g. `shot /search /tmp/s.png`) |
-| `node driver.mjs eval <route> '<js>'` | navigate, run JS in the webview, print the JSON result |
+| `node driver.mjs eval <route> '<js>'` | navigate, run JS in the webview, print the JSON result                |
 
 Example — read state out of the live DOM (returns `"0.1.0"`):
 
@@ -113,8 +113,9 @@ npm run tauri:dev   # Vite + a real window. Useless headless; Ctrl-C to stop.
   `npx tauri build` bakes the frontend in. So after `cargo test --workspace`
   rebuilds `nndd-next`, launching it shows a blank page reading **"Could not
   connect to localhost: Connection refused."** The driver defends against this by
-  auto-starting `npm run dev` (Vite on :1420) before launching — a prod binary
-  ignores it, a dev binary uses it, both render. If you want the pure prod path,
+  auto-starting Vite on :1420 before launching (and verifies an already-running
+  :1420 is actually Vite) — a prod binary ignores it, a dev binary uses it, both
+  render. If you want the pure prod path,
   rebuild with `npx tauri build --debug --no-bundle` and pass `NO_VITE=1`.
 - **WebKitGTK is blank without software-render env vars under Xvfb.** The driver
   exports `WEBKIT_DISABLE_COMPOSITING_MODE=1`, `WEBKIT_DISABLE_DMABUF_RENDERER=1`,

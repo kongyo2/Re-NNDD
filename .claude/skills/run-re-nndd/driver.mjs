@@ -81,12 +81,21 @@ async function wd(method, path, body) {
   return json.value;
 }
 
-async function waitForDriver(timeoutMs = 20000) {
+async function waitForDriver(proc, timeoutMs = 20000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
+    // If the spawned tauri-driver died (e.g. port already bound, or not
+    // installed), fail now instead of silently accepting a stranger on PORT.
+    if (proc.spawnError || proc.exitCode !== null || proc.signalCode) {
+      throw new Error(
+        `tauri-driver exited before binding ${BASE} ` +
+          `(${proc.spawnError || `code ${proc.exitCode ?? proc.signalCode}`}). ` +
+          `Is it installed and is the port free?`,
+      );
+    }
     try {
       const r = await fetch(BASE + '/status');
-      if (r.ok || r.status === 500) return; // any HTTP answer = listening
+      if (r.ok || r.status === 500) return; // our tauri-driver is answering
     } catch {
       /* not up yet */
     }
@@ -104,6 +113,20 @@ async function httpUp(url) {
   }
 }
 
+// Confirm a server on :1420 is actually a Vite dev server (it always serves its
+// HMR client module here) — not some unrelated/stale process we'd otherwise
+// screenshot by mistake.
+async function isViteServer() {
+  try {
+    const r = await fetch('http://127.0.0.1:1420/@vite/client', {
+      signal: AbortSignal.timeout(1500),
+    });
+    return r.ok && (r.headers.get('content-type') || '').includes('javascript');
+  } catch {
+    return false;
+  }
+}
+
 // Tauri *debug* builds default to dev mode and load the Vite devUrl
 // (http://localhost:1420); only `npx tauri build` bakes the frontend in for a
 // prod-style load. A plain `cargo build`/`cargo test` on the workspace silently
@@ -113,7 +136,14 @@ async function httpUp(url) {
 // needs it. Set NO_VITE=1 to skip (pure prod binary, slightly faster).
 async function ensureVite() {
   if (process.env.NO_VITE) return null;
-  if (await httpUp('http://127.0.0.1:1420')) return null; // already running
+  if (await httpUp('http://127.0.0.1:1420')) {
+    if (await isViteServer()) return null; // reuse the Vite already running
+    throw new Error(
+      'port 1420 is occupied by a non-Vite server — a dev-mode binary would ' +
+        'load it and screenshot the wrong app. Free :1420, or pass NO_VITE=1 ' +
+        'if you built a prod binary (npx tauri build).',
+    );
+  }
   console.log('starting Vite dev server for dev-mode binary…');
   const log = '/tmp/re-nndd-vite.log';
   const out = (await import('node:fs')).openSync(log, 'w');
@@ -138,16 +168,30 @@ async function ensureVite() {
   throw new Error(`Vite did not come up on :1420 in 40s (see ${log})`);
 }
 
-function startDriver() {
+async function startDriver() {
+  // Refuse to attach to a pre-existing listener on PORT: if something else owns
+  // it our spawned tauri-driver can't bind, and /session would silently hit the
+  // stranger while cleanup only kills our (dead) child. A fresh run expects the
+  // port free — the driver reaps its own.
+  if (await httpUp(BASE + '/status')) {
+    throw new Error(
+      `something is already listening on ${BASE} — refusing to attach. ` +
+        `Free it (pkill -f tauri-driver) or set PORT to a free port.`,
+    );
+  }
   // tauri-driver passes our env (incl. WEBKIT_* software-render flags) down to
   // WebKitWebDriver and the app it launches.
   const proc = spawn('tauri-driver', ['--port', String(PORT)], {
     stdio: ['ignore', 'inherit', 'inherit'],
     env: process.env,
   });
+  // Record the failure instead of process.exit() here: exiting from this async
+  // event handler bypasses main()'s finally and would orphan the Vite server
+  // ensureVite() started. waitForDriver() sees spawnError and throws, so the
+  // finally block runs and tears Vite down.
+  proc.spawnError = null;
   proc.on('error', (e) => {
-    console.error('failed to spawn tauri-driver:', e.message);
-    process.exit(1);
+    proc.spawnError = e.message;
   });
   return proc;
 }
@@ -176,7 +220,6 @@ const css = (sid, selector) =>
   wd('POST', `/session/${sid}/element`, { using: 'css selector', value: selector });
 const cssAll = (sid, selector) =>
   wd('POST', `/session/${sid}/elements`, { using: 'css selector', value: selector });
-const elText = (sid, eid) => wd('GET', `/session/${sid}/element/${eid}/text`);
 const elClick = (sid, eid) => wd('POST', `/session/${sid}/element/${eid}/click`, {});
 const execute = (sid, script, args = []) =>
   wd('POST', `/session/${sid}/execute/sync`, { script, args });
@@ -224,11 +267,15 @@ async function main() {
     console.error(`app binary not found: ${APP_BIN}\nBuild it first (see SKILL.md).`);
     process.exit(2);
   }
-  const vite = await ensureVite();
-  const driver = startDriver();
+  // Everything that can leak a process is created inside the try so the finally
+  // tears it down even if a later step (e.g. startDriver port check) throws.
+  let vite = null;
+  let driver = null;
   let sid;
   try {
-    await waitForDriver();
+    vite = await ensureVite();
+    driver = await startDriver();
+    await waitForDriver(driver);
     sid = await newSession();
     // Home always renders the brand; use it as the "app is alive" signal.
     // The 109MB debug binary + WebKitGTK cold start can take >15s under CPU
@@ -268,7 +315,7 @@ async function main() {
     } catch {
       /* ignore */
     }
-    driver.kill('SIGTERM');
+    if (driver) driver.kill('SIGTERM');
     if (vite) {
       try {
         process.kill(-vite.pid, 'SIGTERM'); // negative pid = whole group

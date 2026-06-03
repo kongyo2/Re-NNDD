@@ -5,4 +5,7 @@ node_modules
 src-tauri/target
 target
 package-lock.json
-.claude
+# Ignore local .claude state (settings.local.json, etc.) but still format-check
+# committed skills.
+.claude/*
+!.claude/skills/
