@@ -191,7 +191,11 @@ jobs:
           # 続行。タグは checkout で全取得済みのローカル参照なので、API のページング
           # 窓 (--limit) や一過性失敗に左右されない。安定版のみ扱うため sort -V は
           # SemVer precedence と一致する。
-          latest="$(git tag -l 'v*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          # 現バージョン自身は除外する: 「tag push 済み・dispatch 失敗」の再 run では
+          # 自分のタグが最大版として混入し $VERSION = $latest で誤って降格扱いになり、
+          # dispatch retry パスに到達できなくなる。Release 未完は手前の gh release view
+          # で確認済みなので、自タグは降格判定の対象外にする (指す先検証は後段で担保)。
+          latest="$(git tag -l 'v*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | grep -vx "$VERSION" | sort -V | tail -n1 || true)"
           if [ -n "$latest" ]; then
             highest="$(printf '%s\n%s\n' "$latest" "$VERSION" | sort -V | tail -n1)"
             if [ "$VERSION" = "$latest" ] || [ "$highest" != "$VERSION" ]; then
