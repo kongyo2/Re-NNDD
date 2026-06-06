@@ -36,6 +36,15 @@ export default ts.config(
     },
   },
   {
-    ignores: ['build/', '.svelte-kit/', 'dist/', 'src-tauri/target/', 'target/'],
+    ignores: [
+      'build/',
+      '.svelte-kit/',
+      'dist/',
+      'src-tauri/target/',
+      'target/',
+      'test-results/',
+      'playwright-report/',
+      'blob-report/',
+    ],
   },
 );

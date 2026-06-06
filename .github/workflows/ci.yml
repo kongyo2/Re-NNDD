@@ -85,6 +85,53 @@ jobs:
           retention-days: 7
 
   # ──────────────────────────────────────────────────────────────────────────
+  # E2E: Playwright がフロント (Vite dev server :1420) を実ブラウザで駆動。
+  # Tauri IPC は tests/e2e/helpers/tauri-mock.ts で擬装する (実 Rust 不要)。
+  # 実 WebKitGTK ウィンドウの駆動は別 (run-re-nndd skill の driver.mjs) の領分。
+  # ──────────────────────────────────────────────────────────────────────────
+  e2e:
+    name: E2E (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies (npm ci)
+        run: npm ci --no-audit --no-fund
+
+      # Chromium のみ (playwright.config.ts は chromium プロジェクト 1 本)。
+      # --with-deps で WebKit/Chromium が要求する OS ライブラリも入れる。
+      - name: Install Playwright browser (chromium) + system deps
+        run: npx playwright install --with-deps chromium
+
+      # --with-deps はフォントを含まない。日本語 UI のスクショ文字化け回避に
+      # CJK + emoji フォントを明示インストールする。
+      - name: Install CJK fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk fonts-noto-color-emoji
+
+      # webServer (npm run dev) は playwright.config.ts が CI で自前起動する。
+      - name: Playwright E2E tests
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-${{ github.sha }}
+          path: playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ──────────────────────────────────────────────────────────────────────────
   # Rust: Tauri 2 ワークスペース (fmt / clippy / test / build)
   # ──────────────────────────────────────────────────────────────────────────
   rust:
@@ -220,6 +267,7 @@ jobs:
     if: ${{ !cancelled() }}
     needs:
       - frontend
+      - e2e
       - rust
       - actionlint
       - shellcheck

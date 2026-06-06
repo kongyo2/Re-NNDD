@@ -44,6 +44,12 @@ Thumbs.db
 /coverage/
 *.lcov
 
+# Playwright (E2E)
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+
 # Local agent/tool state
 .agents/
 .claude/
