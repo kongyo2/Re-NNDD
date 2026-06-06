@@ -11,11 +11,19 @@ name: Auto release on version bump
 #      直前コミットから変化した時だけ続行 (dependabot 等の依存更新は no-op)。
 #      → 3 ファイルを見るので「1 ファイル直し忘れ→修正コミット」でも拾える。
 #   3. 3 ファイルの version 一致を検証 (ズレていれば fail)。
-#   4. 「その version の GitHub Release が未作成」かつ「直近 Release より新しい」
+#   4. 「その version の GitHub Release が未作成」かつ「既存タグの最大版より新しい」
 #      時だけタグを切り、release.yml を dispatch する。
 #      - Release の有無で冪等性を担保 (tag push 成功・dispatch 失敗の再 run でも
 #        Release が無ければ再 dispatch される)。
-#      - 直近 Release より新しい事を要求し、誤ダウングレード公開を防ぐ。
+#      - 既存 v* タグの最大版より厳密に新しい事を要求し、誤ダウングレード公開を防ぐ。
+#
+# 制約・設計判断:
+#   - auto-release が扱うのは安定版 (strict `X.Y.Z`) のみ。prerelease (`-beta` 等)
+#     は誤って latest 安定版として公開されるのを避けるため弾く。prerelease を出す
+#     時は release.yml を手動 dispatch (prerelease=true) する。
+#   - 「Release は在るが一部プラットフォームの asset 欠落 (release.yml の matrix 片
+#     落ち)」の復旧はここでは扱わない。それは release.yml 側の失敗ジョブ再実行 /
+#     手動 dispatch の領分で、auto-release が 4 OS 再ビルドを再発火させるのは過剰。
 #
 # セキュリティ上の注意:
 #   - これは contents: write / actions: write を持つ特権ワークフロー。実行は
@@ -64,7 +72,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          # 直前バージョンとの差分確認 + タグ存在確認のため全履歴 / 全タグを取得。
+          # 直前バージョンとの差分確認 + 既存タグ全取得 (ダウングレード判定/タグ
+          # 検証をローカルで完結させ、API のページングや一過性失敗に依存しない)。
           fetch-depth: 0
 
       - name: Detect version change
@@ -96,10 +105,11 @@ jobs:
             exit 1
           fi
 
-          # SemVer 厳格検証: 後段の run/タグ名に渡る値を英数字.- に限定し、
-          # `$(...)` 等のシェルメタ文字混入を入口で遮断する (インジェクション対策)。
-          if ! printf '%s' "$cur_t" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "::error::Version '$cur_t' is not a strict SemVer (X.Y.Z[-prerelease])."
+          # 安定版 SemVer のみ受理。run/タグ名に渡る値を英数字と . に限定し
+          # `$(...)` 等のメタ文字を入口で遮断する (インジェクション対策)。prerelease
+          # (`-beta` 等) は安定版として誤公開されるのを避けるため弾く。
+          if ! printf '%s' "$cur_t" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version '$cur_t' must be a stable SemVer (X.Y.Z). Prereleases are not auto-released; dispatch release.yml manually instead."
             exit 1
           fi
 
@@ -159,26 +169,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 冪等性: その version の Release が既にあれば何もしない。
-          # tag ではなく Release の有無で見ることで、「tag push は済んだが dispatch
-          # が失敗した」中途半端な状態の再 run でも、Release 未作成なら再 dispatch
-          # できる (= 安全に retry 可能)。
-          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+          # 冪等性: その version の Release が既にあれば何もしない。tag ではなく
+          # Release の有無で見ることで、「tag push 済み・dispatch 失敗」の再 run でも
+          # Release 未作成なら再 dispatch できる。lookup は fail-closed: 404 (未作成)
+          # と認証/レート等の一過性エラーを区別し、後者では止める (誤公開防止)。
+          set +e
+          view_err="$(gh release view "$TAG" --repo "$GH_REPO" 2>&1 >/dev/null)"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
             echo "::notice::Release $TAG already exists; nothing to do."
             echo "do_release=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          if ! printf '%s' "$view_err" | grep -qiE 'release not found|not found|HTTP 404'; then
+            echo "::error::Could not determine whether release $TAG exists (treating as fatal): $view_err"
+            exit 1
+          fi
 
-          # 誤ダウングレード公開の防止: 既存 Release がある場合、現 version が
-          # それより厳密に新しい時だけ続行する。
-          latest="$(gh release list --repo "$GH_REPO" --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null \
-                    | sed 's/^v//' \
-                    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' \
-                    | sort -V | tail -n1 || echo '')"
+          # ダウングレード公開の防止: 既存 v* タグの最大安定版より厳密に新しい時だけ
+          # 続行。タグは checkout で全取得済みのローカル参照なので、API のページング
+          # 窓 (--limit) や一過性失敗に左右されない。安定版のみ扱うため sort -V は
+          # SemVer precedence と一致する。
+          latest="$(git tag -l 'v*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
           if [ -n "$latest" ]; then
             highest="$(printf '%s\n%s\n' "$latest" "$VERSION" | sort -V | tail -n1)"
             if [ "$VERSION" = "$latest" ] || [ "$highest" != "$VERSION" ]; then
-              echo "::notice::Current version $VERSION is not newer than the latest release $latest; skipping."
+              echo "::notice::Current version $VERSION is not newer than the highest released tag v$latest; skipping."
               echo "do_release=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -195,9 +212,16 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 直前 run でタグだけ push 済み (dispatch 失敗) の retry を考慮し、既存なら再利用。
-          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
-            echo "::notice::Tag $TAG already exists on origin; reusing it (retried run)."
+          # 既存タグ (前 run でタグだけ push して dispatch 失敗した等) の再利用時は、
+          # 必ず bump コミットを指している事を検証する。手動/別コミット由来のタグを
+          # そのまま --ref に使うと、検証済みでないツリーを公開してしまうため。
+          if git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null 2>&1; then
+            tag_commit="$(git rev-list -n1 "refs/tags/$TAG")"
+            if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $TAG already exists but points at $tag_commit, not the bump commit $GITHUB_SHA. Refusing to release a different tree."
+              exit 1
+            fi
+            echo "::notice::Tag $TAG already exists and matches the bump commit; reusing it."
           else
             git tag -a "$TAG" -m "Release $TAG"
             git push origin "refs/tags/$TAG"
@@ -213,9 +237,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # 即時 正式公開: draft=false / prerelease=false。
-          # --ref を作成タグにすることで、リリースは必ず bump commit のツリーから組まれる。
-          # 一過性の失敗に備えて指数バックオフで retry。
+          # 即時 正式公開: draft=false / prerelease=false。auto-release は安定版のみ
+          # 通すので prerelease=false で常に正しい。--ref を作成タグにすることで
+          # リリースは必ず bump commit のツリーから組まれる。一過性失敗に備えて retry。
           for attempt in 1 2 3 4; do
             if gh workflow run release.yml \
                  --repo "$GH_REPO" \
