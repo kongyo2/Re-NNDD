@@ -694,6 +694,19 @@
     reattaching = false;
     restoreAfterReattach = null;
     suppressPlayEventOnce = false;
+    // 復元シーク関連の UI 状態も畳む。これを怠るとコメント凍結 (restoreSeeking) や
+    // シークマスク (isSeeking) が 5 秒 fallback まで残り、別画質での復帰時に映像が
+    // 隠れたままになる。
+    restoreSeeking = false;
+    if (restoreSeekTimer) {
+      clearTimeout(restoreSeekTimer);
+      restoreSeekTimer = null;
+    }
+    isSeeking = false;
+    if (seekUnhideTimer) {
+      clearTimeout(seekUnhideTimer);
+      seekUnhideTimer = null;
+    }
     // 再アタッチ中に onPlayState で抑制した実際の pause 状態を反映する。これを
     // しないと、失敗して停止した player が controls / plugin / isPaused 上で
     // 再生中のまま見えてしまう。
@@ -752,14 +765,11 @@
   // (相対シーク / フレームステップ / AB 点 / スクショ / getCurrentTime) はこの
   // 論理位置を使う。保留中の seek / 未適用 resume (pendingSeek) を優先する。
   function currentLogicalTime(): number {
-    if (reattaching) {
-      // 未適用の seek 要求があればそれが論理位置。
-      if (pendingSeek != null) return pendingSeek;
-      // 消費後は要素に適用済みの位置を読む (0 は detach 直後の過渡値なので、その間
-      // だけ frozen な currentTime にフォールバックする)。
-      const vt = video?.currentTime ?? 0;
-      return vt > 0 ? vt : currentTime;
-    }
+    // 再アタッチ中は currentTime state を論理位置の真値として使う。過渡的な 0 への
+    // 巻き戻りは onTimeUpdate 抑制で反映されず、適用済み/予約シークは下記の
+    // onReattachSeek / publishLogicalTime で currentTime に反映されるため、未適用の
+    // pendingSeek があればそれ、無ければ currentTime が論理位置になる。
+    if (reattaching) return pendingSeek ?? currentTime;
     return video?.currentTime ?? currentTime;
   }
   // 論理位置を currentTime state / onTime / player:time へ反映する。再アタッチ中の
@@ -769,6 +779,18 @@
     currentTime = t;
     onTime?.(t);
     pluginBus.emit('player:time', { videoId, currentTime: t });
+  }
+  // 再アタッチ中に適用/予約したシーク位置を publish し、先頭(0)シークで seeked が
+  // 出ないケースのコメント凍結も解除する。
+  function onReattachSeek(pos: number) {
+    publishLogicalTime(pos);
+    if (pos === 0) {
+      restoreSeeking = false;
+      if (restoreSeekTimer) {
+        clearTimeout(restoreSeekTimer);
+        restoreSeekTimer = null;
+      }
+    }
   }
   function seekDelta(delta: number) {
     if (!video) return;
@@ -781,20 +803,9 @@
     // あるので、readyState>=1 (HAVE_METADATA) を待ってから適用する。
     if (video.readyState < 1) {
       pendingSeek = Math.max(0, t);
-      if (reattaching) {
-        // 再アタッチ中の明示シークは論理位置として publish する (PiP handoffTime /
-        // onTime / player:time が古い位置のまま固定されないように)。
-        publishLogicalTime(pendingSeek);
-        // 先頭 (0) へのシークは置換要素が既に 0 で seeked が出ないことがある。
-        // コメント凍結を即解除し、fallback まで固まるのを防ぐ。
-        if (pendingSeek === 0) {
-          restoreSeeking = false;
-          if (restoreSeekTimer) {
-            clearTimeout(restoreSeekTimer);
-            restoreSeekTimer = null;
-          }
-        }
-      }
+      // 再アタッチ中の明示シークは論理位置として publish する (PiP handoffTime /
+      // onTime / player:time が古い位置のまま固定されないように)。先頭(0)凍結解除込み。
+      if (reattaching) onReattachSeek(pendingSeek);
       return;
     }
     let target = Math.max(0, t);
@@ -824,6 +835,9 @@
         console.error('[Player] currentTime fallback also failed', e2);
       }
     }
+    // 再アタッチ中に直接適用した (readyState>=1) シークも論理位置として publish する。
+    // 適用済みの 0 シークを detach 過渡リセットと取り違えないようにするため。
+    if (reattaching) onReattachSeek(target);
   }
   function jumpToFraction(frac: number) {
     if (!video) return;
@@ -922,12 +936,13 @@
       // 尊重され、明示停止 (userPaused) も尊重され、再アタッチ中の明示操作も拾える。
       const autoplayIntent = getBool('playback.autoplay') || forceAutoplay;
       const shouldPlay = !video.paused || (!playbackStarted && autoplayIntent && !userPaused);
-      // silentPlay: 既に再生中だった切替は「継続」なので復元再生で player:play を
-      // 出さない。停止→再生 (autoplay/明示) は新規再生なので onPlaying で通知する。
+      // silentPlay: 既に「実際に再生開始済み」だった切替のみ継続扱いで player:play
+      // を抑制する。再生要求済みだが初回 playing 前 (playbackStarted=false) は
+      // まだ player:play を出していないので、新規再生として onPlaying で通知する。
       restoreAfterReattach = {
         play: shouldPlay,
         rate: video.playbackRate,
-        silentPlay: !video.paused,
+        silentPlay: playbackStarted && !video.paused,
       };
       // control bar の表示 (再生/一時停止ボタン) と復元意図を一致させる。これを
       // しないと pre-play autoplay 予定の切替で Play ボタンが出るのにクリックすると
@@ -1066,6 +1081,9 @@
       resumeApplied = true;
       if (resumePosition < duration - 1) {
         video.currentTime = resumePosition;
+        // 再アタッチ中の resume 適用も論理位置として反映する (currentLogicalTime が
+        // 真値の currentTime を返せるように)。
+        if (reattaching) publishLogicalTime(resumePosition);
       }
     }
     // metadata 来たので保留中の seek 要求を消化
@@ -1424,9 +1442,11 @@
     video.pause();
   }
   export function isPaused(): boolean {
-    // 再アタッチ中も論理的な再生/一時停止状態を返す (reactive paused は再アタッチ中
-    // フリーズし、明示操作 / 復元時に同期される)。PiP 引き継ぎ等の外部読み取り用。
-    return paused;
+    // 再アタッチ中は論理状態 (paused) を返す。通常時は play()/pause() が同期的に
+    // 更新する video.paused を返す — onplay/onpause での paused 反映は遅れるため、
+    // コマンド直後の PiP 引き継ぎが逆の wasPlaying を拾うのを防ぐ。
+    if (reattaching) return paused;
+    return video?.paused ?? paused;
   }
   export function getCurrentTime(): number {
     return currentLogicalTime();
