@@ -134,6 +134,9 @@
   // 復元再生 (restore の play) 由来の onPlaying を 1 度だけ抑制するフラグ。
   // 内部的な再開なので player:play プラグインイベントを出さないために使う。
   let suppressPlayEventOnce = false;
+  // metadata 未ロード時の seek 要求を退避し、ロード後に適用する。画質切り替えの
+  // 再アタッチでは「復元する再生位置」もこれで運ぶ (最新の seek が勝つ)。
+  let pendingSeek: number | null = null;
   // 直近に実際にロードした HLS URL (403 で再発行され差し替わった最新版を含む)。
   // 画質切り替えの再アタッチでは prop の初期 URL ではなくこれを使い、期限切れ
   // URL を読み直して 403 → 再発行のラウンドトリップを踏むのを避ける。
@@ -630,6 +633,7 @@
     desiredLevel = -1;
     restoreAfterReattach = null;
     suppressPlayEventOnce = false;
+    pendingSeek = null;
     activeHlsUrl = '';
     reattaching = false;
     playbackStarted = false;
@@ -646,20 +650,32 @@
     clearPendingVideoError();
   });
 
-  // 画質切り替えの再アタッチ中は、操作対象の <video> が付け替え途中でユーザ/
-  // プラグインの再生・速度操作が失われる。そのため意図を復元スナップショットへ
-  // 反映する。reattaching 中でなければ false を返し、呼び出し側が通常どおり
-  // <video> を直接操作する。
-  function applyReattachIntent(opts: { play?: boolean; rate?: number }): boolean {
-    if (!reattaching || !restoreAfterReattach) return false;
-    if (opts.play !== undefined) restoreAfterReattach.play = opts.play;
-    if (opts.rate !== undefined) restoreAfterReattach.rate = opts.rate;
-    return true;
+  // 端末的なエラー表示に入ったら再アタッチ窓を畳む。これをしないと再アタッチ中の
+  // ロード失敗 (URL 再発行失敗 / リカバリ枯渇 / SRC 非対応) で reattaching と
+  // restoreAfterReattach が残り、時刻/再生状態の更新が永久に抑制され、以後の
+  // play/pause/rate 操作が「適用されないスナップショット」へ吸い込まれてしまう。
+  $effect(() => {
+    if (errorMessage && reattaching) {
+      reattaching = false;
+      restoreAfterReattach = null;
+      suppressPlayEventOnce = false;
+    }
+  });
+
+  // 画質切り替えの再アタッチ中の「明示的な」再生/一時停止 (ユーザ/プラグイン操作)
+  // を復元スナップショットへ反映する。付け替え途中の <video> を直接操作しても
+  // 失われるため。内部的な再アタッチ pause/play と違いこれは実ユーザ操作なので、
+  // reactive な paused 状態を同期し、プラグインイベントも通常どおり通知する。
+  function setReattachPlayIntent(playing: boolean) {
+    if (!restoreAfterReattach) return;
+    restoreAfterReattach.play = playing;
+    paused = !playing;
+    pluginBus.emit(playing ? 'player:play' : 'player:pause', { videoId, currentTime });
   }
   function togglePlay() {
     if (!video) return;
     if (reattaching && restoreAfterReattach) {
-      restoreAfterReattach.play = !restoreAfterReattach.play;
+      setReattachPlayIntent(!restoreAfterReattach.play);
       return;
     }
     if (video.paused) void video.play().catch(() => undefined);
@@ -673,10 +689,6 @@
     if (duration > 0) return duration;
     return Infinity;
   }
-
-  // metadata が来てない時に seek 要求が来たら、ロード完了後に適用するために
-  // 退避しておく。これが無いと先頭巻き戻り or 無反応になる。
-  let pendingSeek: number | null = null;
 
   function applyPendingSeek() {
     if (!video || pendingSeek == null) return;
@@ -751,7 +763,11 @@
   }
   function setRate(r: number) {
     if (!video) return;
-    if (applyReattachIntent({ rate: r })) return;
+    if (reattaching && restoreAfterReattach) {
+      restoreAfterReattach.rate = r;
+      playbackRate = r;
+      return;
+    }
     video.playbackRate = r;
   }
   function toggleComments() {
@@ -759,7 +775,9 @@
   }
   function setQuality(levelIndex: number) {
     if (!hls || !video) return;
-    const levels = hls.levels ?? [];
+    // 再アタッチ中は新 hls の levels が未パースで空になる。UI が表示している
+    // hlsLevels (前回パース結果を保持) で検証し、連打を取りこぼさない。
+    const levels = hlsLevels;
     if (levelIndex < 0 || levelIndex >= levels.length) return;
     if (levelIndex === currentLevel) return;
     // 同じ解像度の別トラック (音声コーデック違い等) を選んだだけなら、
@@ -782,23 +800,20 @@
     userPickedLevel = levelIndex;
     desiredLevel = levelIndex;
     currentLevel = levelIndex;
-    // 既に再アタッチ進行中なら、最初の切替で退避した復元スナップショットと位置
+    // 既に再アタッチ進行中なら、最初の切替で退避したスナップショットと位置
     // (pendingSeek) を保持し、desiredLevel だけ差し替える。これで画質を連打しても
-    // 元の再生位置・再生状態を失わない。
+    // 元の再生位置・再生意図を失わない。
     if (!reattaching) {
-      // 再生中、または再生開始要求済み (バッファリング中で paused=false) なら、
-      // 再生状態・速度を退避して再アタッチ後に復元する。再生位置は pendingSeek
-      // 経由にすることで、再アタッチ中の新しいユーザシークが自然に優先される。
-      // 終了済み (ended) は先頭へ戻す (clamp で末尾に貼り付くのを防ぐ)。
-      if (!video.paused || playbackStarted) {
-        reattaching = true;
-        restoreAfterReattach = { play: !video.paused, rate: video.playbackRate };
-        pendingSeek = video.ended ? 0 : video.currentTime;
-      } else {
-        // 再生開始前の切替: 復元せず通常のロード/オートプレイ経路に任せる
-        // (autoplay 設定が無視されるのを防ぐ)。
-        restoreAfterReattach = null;
-      }
+      reattaching = true;
+      // 位置は再生状態に関わらず常に保持する (終了済みは先頭へ戻し、clamp で
+      // 末尾に貼り付くのを防ぐ)。新しいユーザシークは pendingSeek を上書きして勝つ。
+      pendingSeek = video.ended ? 0 : video.currentTime;
+      // 再アタッチ後に再生すべきか: 再生中、または未開始だが autoplay 予定なら true。
+      // 再生意図と速度を退避し、loadedmetadata で復元する。これで再生開始前の切替
+      // でも autoplay 設定が尊重され、再アタッチ中の明示操作 (下の guard) も拾える。
+      const autoplayIntent = getBool('playback.autoplay') || forceAutoplay;
+      const shouldPlay = !video.paused || (!playbackStarted && autoplayIntent);
+      restoreAfterReattach = { play: shouldPlay, rate: video.playbackRate };
     }
     attachHls();
   }
@@ -930,6 +945,9 @@
       if (Number.isFinite(rate) && rate > 0) video.playbackRate = rate;
       // スナップショットを消費したので連打保護フラグ (reattaching) は解除する。
       reattaching = false;
+      // 復元後の paused 状態を同期する (再アタッチ中の明示 pause を UI/プラグインの
+      // getState に反映するため)。
+      paused = !play;
       if (play) {
         // 直後の onPlaying は内部的な再開なので player:play を 1 度だけ抑制する。
         // play() が拒否されたらフラグを残さない。
@@ -1208,15 +1226,29 @@
   }
   export function play() {
     if (!video) return;
-    if (applyReattachIntent({ play: true })) return;
+    if (reattaching && restoreAfterReattach) {
+      setReattachPlayIntent(true);
+      return;
+    }
     void video.play().catch(() => undefined);
   }
   export function pause() {
     if (!video) return;
-    if (applyReattachIntent({ play: false })) return;
+    if (reattaching && restoreAfterReattach) {
+      setReattachPlayIntent(false);
+      return;
+    }
     video.pause();
   }
+  export function isPaused(): boolean {
+    // 再アタッチ中も論理的な再生/一時停止状態を返す (reactive paused は再アタッチ中
+    // フリーズし、明示操作 / 復元時に同期される)。PiP 引き継ぎ等の外部読み取り用。
+    return paused;
+  }
   export function getCurrentTime(): number {
+    // 再アタッチ中は <video>.currentTime が一時的に 0 になるため、frozen な論理
+    // 位置 (currentTime state) を返す。
+    if (reattaching) return currentTime;
     return video?.currentTime ?? currentTime;
   }
 </script>
