@@ -172,6 +172,9 @@
   // エラー時の遅延再接続 (attachHls) タイマー。手動再アタッチ時に取り消し、古い
   // タイマーが復元済みソースを壊さないようにする。
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // 直前の再アタッチが terminal 失敗で畳まれたか。失敗した同一画質の再選択を
+  // 許すために使う (MANIFEST_PARSED 成功 / 別動画でクリア)。
+  let reattachFailed = false;
 
   const MAX_HLS_REISSUE_RETRIES = 3;
   const MAX_RECOVERY_ATTEMPTS = 3;
@@ -442,6 +445,7 @@
         reissueAttempts = 0;
         mediaRecoveryAttempts = 0;
         networkRecoveryAttempts = 0;
+        reattachFailed = false;
         if (!hls) return;
         hlsLevels = hls.levels ?? [];
 
@@ -687,6 +691,12 @@
     playbackStarted = false;
     userPaused = false;
     initialized = false;
+    reattachFailed = false;
+    // 前動画のマニフェスト由来の画質メニューを残さない (新マニフェスト parse まで
+    // 古い levels で setQuality が走り、前動画の currentTime を pendingSeek に拾って
+    // 新動画が前動画の位置から始まるのを防ぐ)。新 MANIFEST_PARSED で再投入される。
+    hlsLevels = [];
+    currentLevel = -1;
     hlsUrlPrev = url;
     attachHls();
   });
@@ -708,9 +718,17 @@
   // まれてしまう。一過性エラー (3 秒猶予の video error 等) では呼ばない —
   // HLS がまだ復帰しうるため、誤って再生意図を捨てない。
   function cancelReattach() {
+    // 再生中だった切替 (継続再生 = silentPlay) を終了失敗で畳む場合、抑制した
+    // detach pause の代わりに player:pause を 1 回出す (subscriber が playing の
+    // まま残らないように)。明示一時停止済み (silentPlay=false 化) なら既に通知済み。
+    const emitPause = restoreAfterReattach?.silentPlay === true;
+    const pausePos = currentLogicalTime();
     reattaching = false;
     restoreAfterReattach = null;
     suppressPlayEventOnce = false;
+    // 失敗した切替の再試行で同じ画質を選び直せるようにする (currentLevel は eager に
+    // 進めているため、これが無いと同一選択が setQuality 冒頭で弾かれる)。
+    reattachFailed = true;
     // 復元シーク関連の UI 状態も畳む。これを怠るとコメント凍結 (restoreSeeking) や
     // シークマスク (isSeeking) が 5 秒 fallback まで残り、別画質での復帰時に映像が
     // 隠れたままになる。
@@ -728,6 +746,7 @@
     // しないと、失敗して停止した player が controls / plugin / isPaused 上で
     // 再生中のまま見えてしまう。
     if (video) paused = video.paused;
+    if (emitPause) pluginBus.emit('player:pause', { videoId, currentTime: pausePos });
   }
 
   // 画質切り替えの再アタッチ中の「明示的な」再生/一時停止 (ユーザ/プラグイン操作)
@@ -905,7 +924,9 @@
     // hlsLevels (前回パース結果を保持) で検証し、連打を取りこぼさない。
     const levels = hlsLevels;
     if (levelIndex < 0 || levelIndex >= levels.length) return;
-    if (levelIndex === currentLevel) return;
+    // 失敗した切替の再試行では同一画質の選択も通す (currentLevel は eager に進めて
+    // いるため、失敗時に同じ画質を選び直せるようにする)。
+    if (levelIndex === currentLevel && !reattachFailed) return;
     // 同じ解像度の別トラック (音声コーデック違い等) を選んだだけなら、
     // 映像コーデックは変わらないので再バッファせず内部状態だけ更新する。
     const curHeight = currentLevel >= 0 ? levels[currentLevel]?.height : undefined;
@@ -1566,6 +1587,9 @@
           !!video && (!video.paused || (video.currentTime > 0 && video.readyState >= 2));
         if (recovered) return;
         errorMessage = `動画再生エラー: ${detail}`;
+        // 3 秒猶予後も復帰せず terminal となったので再アタッチ窓も畳む
+        // (SRC_NOT_SUPPORTED 即時分岐と同様、スナップショットの死蔵を防ぐ)。
+        cancelReattach();
       }, 3000);
     }}
     preload="auto"
