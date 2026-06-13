@@ -124,6 +124,12 @@
   let currentLevel = $state(-1);
   let lastTimeUpdateTs = 0;
   let userPickedLevel = -1;
+  // 画質切り替えで hls.js を作り直す時、新インスタンスを「ユーザが選んだレベル」
+  // に固定するための退避値 (-1 = 自動/最良)。MANIFEST_PARSED で参照する。
+  // 別動画へ遷移したら $effect でリセットする。
+  let desiredLevel = -1;
+  // 画質切り替えで再アタッチした直後に復元する再生位置と再生状態。
+  let restoreAfterReattach: { time: number; play: boolean } | null = null;
 
   const MAX_HLS_REISSUE_RETRIES = 3;
   const MAX_RECOVERY_ATTEMPTS = 3;
@@ -386,7 +392,12 @@
         hlsLevels = hls.levels ?? [];
 
         let targetIdx = -1;
-        if (initialQualityLabel && hls.levels) {
+        // 画質切り替えによる再アタッチ時は、ユーザが選んだレベルを最優先で固定。
+        // (URL 再発行をまたいでも選択画質を維持する)
+        if (desiredLevel >= 0 && desiredLevel < (hls.levels?.length ?? 0)) {
+          targetIdx = desiredLevel;
+        }
+        if (targetIdx < 0 && initialQualityLabel && hls.levels) {
           targetIdx = hls.levels.findIndex(
             (l) =>
               l.height?.toString() === initialQualityLabel?.replace('p', '') ||
@@ -596,6 +607,10 @@
     const url = hlsUrl;
     if (!url) return;
     if (url === hlsUrlPrev && hls) return; // already attached to this URL
+    // 別動画へ切り替わった: 前動画でのユーザ画質固定/復元状態はリセットし、
+    // 最良画質から始める (レベル index は動画ごとに意味が異なるため)。
+    desiredLevel = -1;
+    restoreAfterReattach = null;
     hlsUrlPrev = url;
     attachHls();
   });
@@ -706,10 +721,32 @@
     commentsEnabled = !commentsEnabled;
   }
   function setQuality(levelIndex: number) {
-    if (!hls) return;
+    if (!hls || !video) return;
+    const levels = hls.levels ?? [];
+    if (levelIndex < 0 || levelIndex >= levels.length) return;
+    if (levelIndex === currentLevel) return;
+    // 同じ解像度の別トラック (音声コーデック違い等) を選んだだけなら、
+    // 映像コーデックは変わらないので再バッファせず内部状態だけ更新する。
+    const curHeight = currentLevel >= 0 ? levels[currentLevel]?.height : undefined;
+    const nextHeight = levels[levelIndex]?.height;
+    if (curHeight != null && curHeight === nextHeight) {
+      userPickedLevel = levelIndex;
+      currentLevel = levelIndex;
+      return;
+    }
+    // WebKitGTK の MSE は、再生中のバッファを保持/フラッシュしたままの
+    // mid-stream な解像度・コーデック切替 (hls.currentLevel / nextLevel) で
+    // decoder が永久停止することがある。niconico Domand は画質ごとに H.264
+    // profile も解像度も異なる (例: avc1.4d401e/320x240 ⇄ avc1.42c01e/480x360)
+    // ため、これが「画質切り替えで止まる」の原因になっていた。
+    // hls.js を作り直して選択レベル固定で attach し直し、SourceBuffer の
+    // コーデック再構成を完全に回避する。再生位置と再生状態は復元する
+    // (同じ <video> 要素を使うので音量/速度/ミュートは保持される)。
     userPickedLevel = levelIndex;
-    hls.currentLevel = levelIndex;
+    desiredLevel = levelIndex;
     currentLevel = levelIndex;
+    restoreAfterReattach = { time: video.currentTime, play: !video.paused };
+    attachHls();
   }
   function setCommentOpacity(o: number) {
     commentOpacity = o;
@@ -822,6 +859,16 @@
   function onLoadedMetadata() {
     applyPendingSeek();
     if (!video) return;
+    // 画質切り替えで hls.js を作り直した直後は、再生位置と再生状態だけ復元する。
+    // <video> 要素は使い回しているので音量/速度/ミュートは保持されており、
+    // 通常の音量・オートプレイ既定ロジック (下の分岐) は適用しない。
+    if (restoreAfterReattach) {
+      const { time, play } = restoreAfterReattach;
+      restoreAfterReattach = null;
+      if (Number.isFinite(time) && time > 0) seekTo(time);
+      if (play) void video.play().catch(() => undefined);
+      return;
+    }
     // 設定からデフォルト値を反映
     const defaultRate = getNum('playback.default_rate');
     if (Number.isFinite(defaultRate) && defaultRate > 0) {
