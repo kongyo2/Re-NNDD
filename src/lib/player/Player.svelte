@@ -653,6 +653,11 @@
     restoreAfterReattach = null;
     suppressPlayEventOnce = false;
     pendingSeek = null;
+    restoreSeeking = false;
+    if (restoreSeekTimer) {
+      clearTimeout(restoreSeekTimer);
+      restoreSeekTimer = null;
+    }
     activeHlsUrl = '';
     reattaching = false;
     playbackStarted = false;
@@ -873,6 +878,12 @@
       const autoplayIntent = getBool('playback.autoplay') || forceAutoplay;
       const shouldPlay = !video.paused || (!playbackStarted && autoplayIntent && !userPaused);
       restoreAfterReattach = { play: shouldPlay, rate: video.playbackRate };
+    } else if (initialized) {
+      // 連打 (再アタッチ中の再切替): play/rate スナップショットは保持しつつ位置を
+      // 取り直す。最初の reattach の durationchange で pendingSeek が消費済みでも、
+      // frozen な論理位置から復元し、次の置換が 0 から始まるのを防ぐ。
+      const pos = currentLogicalTime();
+      if (Number.isFinite(pos) && pos > 0) pendingSeek = pos;
     }
     attachHls();
   }
