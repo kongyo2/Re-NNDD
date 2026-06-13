@@ -208,7 +208,7 @@
   async function takeScreenshot() {
     const container = stage;
     const captureComments = commentsEnabled;
-    const t = currentTime;
+    const t = currentLogicalTime();
     if (!container) return;
     screenshotMsg = 'スクリーンショット準備中…';
     const rect = container.getBoundingClientRect();
@@ -673,6 +673,10 @@
     reattaching = false;
     restoreAfterReattach = null;
     suppressPlayEventOnce = false;
+    // 再アタッチ中に onPlayState で抑制した実際の pause 状態を反映する。これを
+    // しないと、失敗して停止した player が controls / plugin / isPaused 上で
+    // 再生中のまま見えてしまう。
+    if (video) paused = video.paused;
   }
 
   // 画質切り替えの再アタッチ中の「明示的な」再生/一時停止 (ユーザ/プラグイン操作)
@@ -717,12 +721,16 @@
     seekTo(t);
   }
 
+  // 再アタッチ中は <video>.currentTime が一時的に 0 になる。位置を参照する各所
+  // (相対シーク / フレームステップ / AB 点 / スクショ / getCurrentTime) はこの
+  // 論理位置を使う。保留中の seek / 未適用 resume (pendingSeek) を優先する。
+  function currentLogicalTime(): number {
+    if (reattaching) return pendingSeek ?? currentTime;
+    return video?.currentTime ?? currentTime;
+  }
   function seekDelta(delta: number) {
     if (!video) return;
-    // 再アタッチ中は video.currentTime が 0 にリセットされるため、frozen な論理位置
-    // (pendingSeek があればそれ、無ければ currentTime state) を基点に相対シークする。
-    const base = reattaching ? (pendingSeek ?? currentTime) : video.currentTime;
-    seekTo(base + delta);
+    seekTo(currentLogicalTime() + delta);
   }
   function seekTo(t: number) {
     if (!video) return;
@@ -849,11 +857,11 @@
   }
   function setAbIn() {
     if (!video) return;
-    abLoop = { ...abLoop, in: video.currentTime };
+    abLoop = { ...abLoop, in: currentLogicalTime() };
   }
   function setAbOut() {
     if (!video) return;
-    abLoop = { ...abLoop, out: video.currentTime };
+    abLoop = { ...abLoop, out: currentLogicalTime() };
   }
   function toggleAbLoop() {
     if (abLoop.in == null || abLoop.out == null) return;
@@ -864,8 +872,16 @@
   }
   function frameStep(forward: boolean) {
     if (!video) return;
+    const step = forward ? 1 / 30 : -1 / 30;
+    if (reattaching && restoreAfterReattach) {
+      // 再アタッチ中はフレームステップも論理状態へ反映する (停止扱いにして位置を
+      // 進める)。付け替え途中の <video> を直接操作しても失われるため。
+      setReattachPlayIntent(false);
+      pendingSeek = Math.max(0, currentLogicalTime() + step);
+      return;
+    }
     if (!video.paused) video.pause();
-    video.currentTime += forward ? 1 / 30 : -1 / 30;
+    video.currentTime += step;
   }
 
   type FullscreenDocument = Document & {
@@ -1306,10 +1322,7 @@
     return paused;
   }
   export function getCurrentTime(): number {
-    // 再アタッチ中は <video>.currentTime が一時的に 0 になるため論理位置を返す。
-    // 保留中の seek / 未適用 resume (pendingSeek) があればそれを優先する。
-    if (reattaching) return pendingSeek ?? currentTime;
-    return video?.currentTime ?? currentTime;
+    return currentLogicalTime();
   }
 </script>
 
