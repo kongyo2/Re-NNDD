@@ -853,6 +853,18 @@
       // ユーザシークがあれば既に pendingSeek が勝つので、ここでは触らない。
       if (initialized) {
         pendingSeek = video.ended ? 0 : video.currentTime;
+        // 復元シーク (0→保存位置) の完了までコメント overlay を凍結する。ここで
+        // 立てるのが肝心 — pendingSeek は durationchange で loadedmetadata より先に
+        // 消費されうるため、loadedmetadata 時点での推測では取りこぼす。onSeeked で
+        // 解除し、念のためタイマー fallback も張る (位置 0 は seek 不要なので除外)。
+        if (pendingSeek > 0) {
+          restoreSeeking = true;
+          if (restoreSeekTimer) clearTimeout(restoreSeekTimer);
+          restoreSeekTimer = setTimeout(() => {
+            restoreSeeking = false;
+            restoreSeekTimer = null;
+          }, 5000);
+        }
       }
       // 再アタッチ後に再生すべきか: 再生中、または「未開始だが autoplay 予定で
       // ユーザが明示停止していない」なら true。再生意図と速度を退避し
@@ -1016,8 +1028,7 @@
   }
   function onLoadedMetadata() {
     // 退避/新規いずれの seek 要求も pendingSeek 経由で適用する (どちらの handler
-    // が先に走っても最新値が勝つ)。restore でシークが走るかを消費前に控える。
-    const restoreSeekInitiated = restoreAfterReattach != null && pendingSeek != null;
+    // が先に走っても最新値が勝つ)。
     applyPendingSeek();
     if (!video) return;
     // 画質切り替えで hls.js を作り直した直後は、再生状態と速度を復元する
@@ -1030,17 +1041,6 @@
       restoreAfterReattach = null;
       // スナップショットを消費したので連打保護フラグ (reattaching) は解除する。
       reattaching = false;
-      // 復元シークが走るならコメント overlay をその完了まで凍結し続ける (restore
-      // seek 中に canvas が一瞬空白になるのを防ぐ)。onSeeked で解除し、同位置シークで
-      // seeked が出ない場合に備えタイマーでも解除する。
-      if (restoreSeekInitiated) {
-        restoreSeeking = true;
-        if (restoreSeekTimer) clearTimeout(restoreSeekTimer);
-        restoreSeekTimer = setTimeout(() => {
-          restoreSeeking = false;
-          restoreSeekTimer = null;
-        }, 1000);
-      }
       if (!initialized) {
         // 初回 loadedmetadata 前の早期画質切替: 通常 init をスキップするので、ここで
         // 既定の音量・ミュート・速度を適用する (full-volume/unmuted/既定速度のまま
