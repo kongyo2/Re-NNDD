@@ -169,6 +169,9 @@
   // CommentLayer の freeze に渡すため $state。
   let restoreSeeking = $state(false);
   let restoreSeekTimer: ReturnType<typeof setTimeout> | null = null;
+  // エラー時の遅延再接続 (attachHls) タイマー。手動再アタッチ時に取り消し、古い
+  // タイマーが復元済みソースを壊さないようにする。
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   const MAX_HLS_REISSUE_RETRIES = 3;
   const MAX_RECOVERY_ATTEMPTS = 3;
@@ -384,9 +387,14 @@
   function attachHls() {
     if (!video || !hlsUrl) return;
     detachHls();
-    // 再アタッチ開始時に保留中の一過性 video エラータイマーを止める。これが
-    // 再アタッチ中に発火して errorMessage を立てると、誤って終了扱いされる。
+    // 再アタッチ開始時に保留中の一過性 video エラータイマーと、エラー再接続の遅延
+    // タイマーを止める。後から発火すると復元済みソースを壊したり誤って終了扱いに
+    // してしまう。
     clearPendingVideoError();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     errorMessage = null;
     loadingMessage = 'HLS を初期化中…';
     reissueAttempts = 0;
@@ -607,7 +615,9 @@
         if (refreshHlsUrl && reissueAttempts < MAX_HLS_REISSUE_RETRIES + 1) {
           reissueAttempts += 1;
           loadingMessage = `致命的エラー — 完全再接続中 (${reissueAttempts})…`;
-          setTimeout(() => {
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
             attachHls();
           }, 300);
           return;
@@ -666,6 +676,12 @@
       clearTimeout(restoreSeekTimer);
       restoreSeekTimer = null;
     }
+    // シークマスク状態も畳む (復元シーク中の動画遷移で映像が隠れたまま残らないように)。
+    isSeeking = false;
+    if (seekUnhideTimer) {
+      clearTimeout(seekUnhideTimer);
+      seekUnhideTimer = null;
+    }
     activeHlsUrl = '';
     reattaching = false;
     playbackStarted = false;
@@ -682,6 +698,7 @@
     if (stallNudgeTimer) clearTimeout(stallNudgeTimer);
     if (seekUnhideTimer) clearTimeout(seekUnhideTimer);
     if (restoreSeekTimer) clearTimeout(restoreSeekTimer);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
     clearPendingVideoError();
   });
 
@@ -719,13 +736,15 @@
   // reactive な paused 状態を同期し、プラグインイベントも通常どおり通知する。
   function setReattachPlayIntent(playing: boolean) {
     if (!restoreAfterReattach) return;
+    const wasPlay = restoreAfterReattach.play;
     restoreAfterReattach.play = playing;
     // 明示操作なので復元再生は「継続(無音)」ではない — 再生開始時に player:play を出す。
     restoreAfterReattach.silentPlay = false;
     paused = !playing;
-    // 一時停止は実状態 (停止) と一致するので即通知してよい。再生は docs の契約
+    // 一時停止は実状態 (停止) と一致するので通知してよいが、状態遷移時のみ (連続
+    // フレームステップ等で player:pause を多重 emit しない)。再生は docs の契約
     // (player:play = フレーム出力開始) を守るため、ここでは出さず onPlaying に委ねる。
-    if (!playing) {
+    if (!playing && wasPlay) {
       pluginBus.emit('player:pause', { videoId, currentTime: currentLogicalTime() });
     }
   }
@@ -802,7 +821,12 @@
     // metadata 未ロードだと currentTime 代入が無視 / 失敗する WebKit 挙動が
     // あるので、readyState>=1 (HAVE_METADATA) を待ってから適用する。
     if (video.readyState < 1) {
-      pendingSeek = Math.max(0, t);
+      // 既知の論理 duration があれば範囲内にクランプしてから退避/publish する
+      // (範囲外値が resume として永続化され、次の Player に near-end 判定で弾かれて
+      // 先頭へ戻るのを防ぐ)。
+      let queued = Math.max(0, t);
+      if (duration > 0) queued = Math.min(queued, duration - 0.05);
+      pendingSeek = queued;
       // 再アタッチ中の明示シークは論理位置として publish する (PiP handoffTime /
       // onTime / player:time が古い位置のまま固定されないように)。先頭(0)凍結解除込み。
       if (reattaching) onReattachSeek(pendingSeek);
@@ -914,7 +938,9 @@
       // (初回 durationchange で resume 適用済み / ユーザシーク済みで currentTime>0)
       // なら現在位置を退避する。真の未開始 (位置 0) は resume を通常の
       // onDurationChange (near-end 判定込み) に委ねる。終了済みは先頭。
-      const pos = video.ended ? 0 : video.currentTime;
+      // 直前の失敗切替 (cancelReattach) で退避した位置 (pendingSeek) が残っていれば
+      // それを優先する (失敗要素は 0 にリセット済みで、上書きすると先頭再生になる)。
+      const pos = pendingSeek ?? (video.ended ? 0 : video.currentTime);
       if (initialized || pos > 0) {
         pendingSeek = pos;
         // 復元シーク (0→保存位置) の完了までコメント overlay を凍結する。ここで
@@ -1149,7 +1175,11 @@
         // 継続再生 (silentPlay) のみ onPlaying の player:play を抑制する。新規/明示
         // 再生は契約どおり onPlaying で player:play を出す (再生失敗時は何も出さない)。
         suppressPlayEventOnce = silentPlay === true;
+        const inst = hls;
         void video.play().catch(() => {
+          // 別の attach に置き換わっていたら (連打 / エラー再接続)、この古い reject は
+          // 新しい状態を壊さないよう無視する。
+          if (hls !== inst) return;
           // 再生失敗時: 抑制フラグを残さず、paused を実状態へ同期する。
           suppressPlayEventOnce = false;
           paused = video?.paused ?? true;
