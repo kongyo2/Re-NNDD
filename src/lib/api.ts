@@ -82,12 +82,21 @@ export type SearchResponse = {
   data: SearchHit[];
 };
 
+/** 検索に使うバックエンド API。
+ * - `snapshot`: 公開スナップショット検索 API v2 (認証不要・日次更新)。
+ * - `nvapi`: niconico Web クライアントと同じ内部検索 API。ログイン中は
+ *   保存済みセッション Cookie で認証付き検索になる。 */
+export type SearchEngine = 'snapshot' | 'nvapi';
+
 export async function getAppVersion(): Promise<string> {
   return invoke<string>('get_app_version');
 }
 
-export async function searchVideosOnline(query: SearchQuery): Promise<SearchResponse> {
-  return invoke<SearchResponse>('search_videos_online', { query });
+export async function searchVideosOnline(
+  query: SearchQuery,
+  engine: SearchEngine = 'snapshot',
+): Promise<SearchResponse> {
+  return invoke<SearchResponse>('search_videos_online', { query, engine });
 }
 
 export async function preparePlayback(videoId: string): Promise<PlaybackPayload> {
