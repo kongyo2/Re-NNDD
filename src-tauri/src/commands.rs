@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 use crate::api::auth::{login_with_password, LoginOutcome, SessionStore};
 use crate::api::comment::{Comment, CommentApi, ThreadsClient};
-use crate::api::search::{SearchApi, SnapshotSearchClient};
+use crate::api::search::{NvapiSearchClient, SearchApi, SnapshotSearchClient};
 use crate::api::types::{SearchQuery, SearchResponse};
 use crate::api::video::{
     json_value_as_id_string, quality_candidates, NiconicoWatchClient, NvCommentSetup, SeriesInfo,
@@ -222,10 +222,28 @@ pub fn web_log(level: String, message: String) {
     }
 }
 
+/// オンライン動画検索。`engine` で検索エンジンを切り替える:
+/// - `"snapshot"` (既定): 公開スナップショット検索 API v2。認証不要・日次更新。
+/// - `"nvapi"`: niconico Web クライアントと同じ内部検索 API。ログイン中は
+///   保存済みセッション Cookie を付けて呼ぶため、結果が視聴者アカウントに
+///   追従する (センシティブ表示など)。
 #[tauri::command]
-pub async fn search_videos_online(query: SearchQuery) -> Result<SearchResponse> {
-    let client = SnapshotSearchClient::new().map_err(AppError::from)?;
-    let response = client.search(&query).await.map_err(AppError::from)?;
+pub async fn search_videos_online(
+    query: SearchQuery,
+    engine: Option<String>,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<SearchResponse> {
+    let response = match engine.as_deref() {
+        Some("nvapi") => {
+            // ログイン済みならセッション Cookie を付けて認証付き検索にする。
+            let client = NvapiSearchClient::new(store.cookie_header()).map_err(AppError::from)?;
+            client.search(&query).await.map_err(AppError::from)?
+        }
+        _ => {
+            let client = SnapshotSearchClient::new().map_err(AppError::from)?;
+            client.search(&query).await.map_err(AppError::from)?
+        }
+    };
     Ok(response)
 }
 

@@ -3,7 +3,7 @@
   import { SvelteSet } from 'svelte/reactivity';
   import { page } from '$app/state';
   import { searchVideosOnline } from '$lib/api';
-  import type { SearchField, SearchResponse, SearchTarget } from '$lib/api';
+  import type { SearchEngine, SearchField, SearchResponse, SearchTarget } from '$lib/api';
   import { formatNumber } from '$lib/format';
   import SearchHitCard from '$lib/SearchHitCard.svelte';
   import {
@@ -24,6 +24,7 @@
   let sortField = $state<SortKey>('popularity');
   let sortDir = $state<'desc' | 'asc'>('desc');
   let limit = $state(20);
+  let engine = $state<SearchEngine>('snapshot');
 
   let pending = $state(false);
   let error = $state<string | null>(null);
@@ -58,6 +59,8 @@
       }
       const sort = params.get('sort') as SortKey | null;
       if (sort) sortField = sort;
+      const eng = params.get('engine');
+      if (eng === 'nvapi' || eng === 'snapshot') engine = eng;
       void runSearch();
       return;
     }
@@ -69,6 +72,7 @@
     sortField = prev.sortField;
     sortDir = prev.sortDir;
     limit = prev.limit;
+    engine = prev.engine ?? 'snapshot';
     response = prev.response;
     lastQuery = prev.lastQuery;
     await tick();
@@ -90,6 +94,7 @@
       sortField,
       sortDir,
       limit,
+      engine,
       response,
       lastQuery,
       scrollY: main?.scrollTop ?? window.scrollY,
@@ -126,26 +131,29 @@
     try {
       // For popularity sort, over-fetch so re-ranking has a bigger pool.
       const apiLimit = sortField === 'popularity' ? Math.min(limit * 3, 100) : limit;
-      const apiResp = await searchVideosOnline({
-        q: query,
-        targets: Array.from(targets),
-        fields: [
-          'contentId',
-          'title',
-          'viewCounter',
-          'commentCounter',
-          'mylistCounter',
-          'lengthSeconds',
-          'thumbnailUrl',
-          'startTime',
-          'tags',
-          'userId',
-          'channelId',
-        ],
-        sort: toApiSort(),
-        limit: apiLimit,
-        offset: 0,
-      });
+      const apiResp = await searchVideosOnline(
+        {
+          q: query,
+          targets: Array.from(targets),
+          fields: [
+            'contentId',
+            'title',
+            'viewCounter',
+            'commentCounter',
+            'mylistCounter',
+            'lengthSeconds',
+            'thumbnailUrl',
+            'startTime',
+            'tags',
+            'userId',
+            'channelId',
+          ],
+          sort: toApiSort(),
+          limit: apiLimit,
+          offset: 0,
+        },
+        engine,
+      );
       if (sortField === 'popularity') {
         apiResp.data = sortByPopularity(apiResp.data).slice(0, limit);
       }
@@ -164,7 +172,11 @@
 <section>
   <h2>オンライン検索</h2>
   <p class="muted">
-    niconico スナップショット検索 API v2 を直接叩く。データは 5:00 JST に日次更新。
+    {#if engine === 'nvapi'}
+      niconico nvapi（公式 Web クライアントと同じ検索 API）を叩く。ログイン中はセッションを使って検索する。
+    {:else}
+      niconico スナップショット検索 API v2 を直接叩く。データは 5:00 JST に日次更新。
+    {/if}
   </p>
 
   <form class="search-form" onsubmit={runSearch}>
@@ -176,6 +188,27 @@
       autocomplete="off"
       aria-label="検索キーワード"
     />
+    <div class="engine-row">
+      <span class="engine-label">検索エンジン</span>
+      <div class="engine-seg" role="group" aria-label="検索エンジン">
+        <button
+          type="button"
+          class:active={engine === 'snapshot'}
+          aria-pressed={engine === 'snapshot'}
+          onclick={() => (engine = 'snapshot')}
+        >
+          スナップショット
+        </button>
+        <button
+          type="button"
+          class:active={engine === 'nvapi'}
+          aria-pressed={engine === 'nvapi'}
+          onclick={() => (engine = 'nvapi')}
+        >
+          nvapi
+        </button>
+      </div>
+    </div>
     <div class="targets" role="group" aria-label="検索対象">
       {#each [['title', 'タイトル'], ['description', '説明文'], ['tags', 'タグ'], ['tagsExact', 'タグ完全一致']] as [t, label] (t)}
         <label class="chip" class:active={targets.has(t as SearchTarget)}>
@@ -277,6 +310,40 @@
   .q:focus {
     outline: none;
     border-color: var(--theme-border-focus);
+  }
+  .engine-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .engine-label {
+    font-size: 12px;
+    color: var(--theme-text-soft);
+  }
+  .engine-seg {
+    display: inline-flex;
+    border: 1px solid var(--theme-border-strong);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .engine-seg button {
+    background: var(--theme-surface-2);
+    color: var(--theme-text-soft);
+    border: none;
+    padding: 5px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .engine-seg button + button {
+    border-left: 1px solid var(--theme-border-strong);
+  }
+  .engine-seg button:hover {
+    background: var(--theme-border-strong);
+  }
+  .engine-seg button.active {
+    background: var(--theme-accent);
+    color: var(--theme-accent-fg);
   }
   .targets {
     display: flex;
