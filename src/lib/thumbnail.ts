@@ -29,15 +29,27 @@ export type ThumbFallbackParams = {
 const TRANSPARENT_PX =
   'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
-/** 動画 ID 単位の再解決結果キャッシュ。短時間に同じ ID を何度も叩かない。 */
+/** 動画 ID 単位の再解決結果キャッシュ。短時間に同じ ID を何度も叩かない。
+ *  ただし失敗(null/reject)は **キャッシュしない** — 一時的なネットワーク障害や
+ *  Cookie 未保存のまま 1 度引いた結果を恒久キャッシュすると、その動画は復旧後も
+ *  二度とバックエンドへ問い合わせなくなってしまう (PR #13 review)。 */
 const resolveCache = new Map<string, Promise<string | null>>();
 
 function resolveAuthoritative(videoId: string): Promise<string | null> {
-  let pending = resolveCache.get(videoId);
-  if (!pending) {
-    pending = invoke<string | null>('resolve_thumbnail_url', { videoId }).catch(() => null);
-    resolveCache.set(videoId, pending);
-  }
+  const cached = resolveCache.get(videoId);
+  if (cached) return cached;
+  // in-flight の Promise はキャッシュして同時多発の重複呼び出しを 1 本化するが、
+  // 解決結果が null(=失敗 or 削除)なら後で再試行できるよう即座に追い出す。
+  const pending = invoke<string | null>('resolve_thumbnail_url', { videoId })
+    .then((url) => {
+      if (!url) resolveCache.delete(videoId);
+      return url ?? null;
+    })
+    .catch(() => {
+      resolveCache.delete(videoId);
+      return null;
+    });
+  resolveCache.set(videoId, pending);
   return pending;
 }
 
@@ -52,6 +64,12 @@ export function thumbFallback(img: HTMLImageElement, params: ThumbFallbackParams
   let triedResolve = false;
   let triedRetry = false;
   let destroyed = false;
+  // update() で別動画に貼り替わるたびに進める世代トークン。再解決の await や
+  // リトライの setTimeout が解決するより前に rebind されると、古い世代の
+  // 継続処理が新しい動画の <img> に旧 URL を書き込んでしまう (リスト仮想化で
+  // 同じノードが使い回されるケース)。遅延 src 操作の直前に毎回照合して弾く
+  // (PR #13 review)。
+  let generation = 0;
 
   function showPlaceholder() {
     img.dataset.thumbBroken = 'true';
@@ -62,8 +80,14 @@ export function thumbFallback(img: HTMLImageElement, params: ThumbFallbackParams
     img.src = TRANSPARENT_PX;
   }
 
+  /** この onError 開始時点の世代から状態が変わっていれば true(=もう触るな)。 */
+  function stale(gen: number): boolean {
+    return destroyed || gen !== generation || img.dataset.thumbBroken === 'true';
+  }
+
   async function onError() {
     if (destroyed || img.dataset.thumbBroken) return;
+    const gen = generation;
     const broken = img.src;
 
     // ① 現行サムネ URL を権威ソースから取り直して貼り替える。
@@ -71,7 +95,7 @@ export function thumbFallback(img: HTMLImageElement, params: ThumbFallbackParams
       triedResolve = true;
       if (videoId) {
         const fresh = await resolveAuthoritative(videoId);
-        if (destroyed || img.dataset.thumbBroken) return;
+        if (stale(gen)) return;
         if (fresh && !sameUrl(fresh, broken)) {
           img.src = fresh;
           return;
@@ -84,13 +108,12 @@ export function thumbFallback(img: HTMLImageElement, params: ThumbFallbackParams
       triedRetry = true;
       const url = broken;
       window.setTimeout(() => {
-        if (destroyed || img.dataset.thumbBroken) return;
+        if (stale(gen)) return;
         // 一旦 src を外してから戻すと、同 URL でも確実に再フェッチが走る。
         img.removeAttribute('src');
         window.setTimeout(() => {
-          if (!destroyed && !img.dataset.thumbBroken && !img.getAttribute('src')) {
-            img.src = url;
-          }
+          if (stale(gen)) return;
+          if (!img.getAttribute('src')) img.src = url;
         }, 30);
       }, 300);
       return;
@@ -106,11 +129,12 @@ export function thumbFallback(img: HTMLImageElement, params: ThumbFallbackParams
     update(next: ThumbFallbackParams) {
       const nextId = next?.videoId ?? null;
       if (nextId !== videoId) {
-        // バインド先の動画が変わったらフォールバック状態をリセットする
-        // (リスト仮想化等で同じ <img> ノードが再利用されるケース)。
+        // バインド先の動画が変わったらフォールバック状態をリセットし、世代を
+        // 進めて旧動画向けの遅延処理(再解決/リトライ)を無効化する。
         videoId = nextId;
         triedResolve = false;
         triedRetry = false;
+        generation += 1;
         delete img.dataset.thumbBroken;
       }
     },

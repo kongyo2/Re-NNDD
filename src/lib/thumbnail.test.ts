@@ -104,4 +104,66 @@ describe('thumbFallback', () => {
     expect(invokeMock).toHaveBeenLastCalledWith('resolve_thumbnail_url', { videoId: 'sm6' });
     action.destroy();
   });
+
+  it('失敗(null)した再解決はキャッシュせず、次回はバックエンドへ再問い合わせする', async () => {
+    invokeMock.mockResolvedValue(null);
+    const img1 = makeImg('https://cdn.example/thumbnails/9/9');
+    const a1 = thumbFallback(img1, { videoId: 'sm9' });
+    img1.dispatchEvent(new Event('error'));
+    await flush();
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+
+    // 同じ動画 ID でも、前回 null だったらキャッシュされていないので再度引く。
+    const img2 = makeImg('https://cdn.example/thumbnails/9/9');
+    const a2 = thumbFallback(img2, { videoId: 'sm9' });
+    img2.dispatchEvent(new Event('error'));
+    await flush();
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    a1.destroy();
+    a2.destroy();
+  });
+
+  it('成功した再解決はキャッシュして重複問い合わせを避ける', async () => {
+    invokeMock.mockResolvedValue('https://cdn.example/thumbnails/10/10.x');
+    const img1 = makeImg('https://cdn.example/thumbnails/10/10');
+    const a1 = thumbFallback(img1, { videoId: 'sm10' });
+    img1.dispatchEvent(new Event('error'));
+    await flush();
+
+    const img2 = makeImg('https://cdn.example/thumbnails/10/10');
+    const a2 = thumbFallback(img2, { videoId: 'sm10' });
+    img2.dispatchEvent(new Event('error'));
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledTimes(1); // 2 回目はキャッシュ命中
+    a1.destroy();
+    a2.destroy();
+  });
+
+  it('再解決の解決前に別動画へ rebind されたら旧 URL を書き込まない', async () => {
+    let settle: (v: string | null) => void = () => {};
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise<string | null>((res) => {
+          settle = res;
+        }),
+    );
+    const img = makeImg('https://cdn.example/thumbnails/11/11');
+    const action = thumbFallback(img, { videoId: 'sm11' });
+
+    img.dispatchEvent(new Event('error')); // sm11 の再解決を開始(未解決のまま保留)
+    await flush();
+
+    // 解決前に別動画へ貼り替え(リスト行の使い回しを模す)。
+    action.update?.({ videoId: 'sm12' });
+    img.src = 'https://cdn.example/thumbnails/12/12';
+
+    // 旧 sm11 の再解決がいま解決しても、世代が違うので src は触らない。
+    settle('https://cdn.example/thumbnails/11/11.OLD');
+    await flush();
+
+    expect(img.src).toContain('/12/12');
+    expect(img.src).not.toContain('OLD');
+    action.destroy();
+  });
 });
