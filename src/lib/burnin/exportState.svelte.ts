@@ -16,20 +16,25 @@
 //
 // プレーン TS (`browser.ts`) と Svelte ルーン (`CommentLayer.svelte`) の両方から
 // 使うため、`.svelte.ts` のルーンストアにする (miniPlayerStore と同じ作法)。
+//
+// 単純な真偽値ではなく **実行中エクスポート数** を数える。別ウィンドウ/連打で
+// 焼き込みが 2 つ重なった場合 (バックエンドは burnin_start で一意な session/出力名を
+// 採るため同時実行を許容する)、先に終わった方が end() を呼んでも、残りの
+// エクスポートが続く限り抑止を解除しないようにするため。
 
-let active = $state(false);
+let activeCount = $state(0);
 
 export const burnInExport = {
-  /** エクスポート実行中か (CommentLayer がリアクティブに購読する)。 */
+  /** いずれかのエクスポートが実行中か (CommentLayer がリアクティブに購読する)。 */
   get active(): boolean {
-    return active;
+    return activeCount > 0;
   },
   /** エクスポート開始時に呼ぶ (= ライブ描画を一時停止させる)。 */
   begin(): void {
-    active = true;
+    activeCount += 1;
   },
   /** エクスポート終了時に呼ぶ (成功・失敗・キャンセルいずれも)。 */
   end(): void {
-    active = false;
+    activeCount = Math.max(0, activeCount - 1);
   },
 };

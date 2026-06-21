@@ -2925,8 +2925,9 @@ pub async fn burnin_cancel(session_id: String, sessions: State<'_, BurnInSession
     }
     if let Some(session) = sessions.remove(&session_id) {
         let mut s = session.lock().await;
-        s.kill().await;
-        let _ = tokio::fs::remove_file(&s.output_path).await;
+        // finish() が成功直後 (completed) のセッションを遅延キャンセルが掴んでも、
+        // 生成済みの正しい出力は削除しない。未完なら kill して部分出力を消す。
+        s.discard_if_incomplete().await;
     }
     Ok(())
 }

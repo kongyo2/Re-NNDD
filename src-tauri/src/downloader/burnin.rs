@@ -72,6 +72,10 @@ pub struct BurnInSession {
     empty_png: Option<Vec<u8>>,
     /// ffmpeg が stdin を閉じた後は以降の書き込みを no-op にするフラグ。
     input_closed: bool,
+    /// finish() が成功して正しい出力を生成し終えたか。セッションロックを保持した
+    /// まま立てる。これで finish 成功とほぼ同時に来た遅延キャンセルが、生成済みの
+    /// 正しい出力を誤って削除するのを防ぐ。
+    completed: bool,
     /// キャンセル通知。finish() が ffmpeg を待っている間に burnin_cancel から
     /// 起こして強制終了させるために使う (セッションロックを介さず通知できる)。
     cancel: Arc<Notify>,
@@ -149,6 +153,10 @@ impl BurnInSession {
                     let status = res
                         .map_err(|e| ApiError::Downloader(format!("wait ffmpeg: {e}")))?;
                     if status.success() {
+                        // ロック保持中に completed を立てる。以降にロックを取る
+                        // 遅延キャンセルは discard_if_incomplete でスキップされ、
+                        // 生成済みの正しい出力が消されない。
+                        self.completed = true;
                         return Ok(());
                     }
                     let stderr = self.stderr.lock().await.clone();
@@ -173,6 +181,17 @@ impl BurnInSession {
         self.input_closed = true;
         self.stdin.take();
         let _ = self.child.kill().await;
+    }
+
+    /// キャンセル時の後始末。finish() が既に成功して正しい出力を生成済みなら
+    /// 何もしない (遅延キャンセルが生成物を消すのを防ぐ)。未完なら ffmpeg を
+    /// kill して部分出力を削除する。
+    pub async fn discard_if_incomplete(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.kill().await;
+        let _ = tokio::fs::remove_file(&self.output_path).await;
     }
 }
 
@@ -354,6 +373,7 @@ pub async fn spawn_session(
         stderr: stderr_buf,
         empty_png: None,
         input_closed: false,
+        completed: false,
         cancel: Arc::new(Notify::new()),
         output_path: output.to_path_buf(),
         width,
@@ -499,6 +519,7 @@ mod tests {
             stderr: Arc::new(AsyncMutex::new(String::new())),
             empty_png: None,
             input_closed: false,
+            completed: false,
             cancel: Arc::new(Notify::new()),
             output_path: std::path::PathBuf::from("/tmp/burnin-test-output.mp4"),
             width: 2,
@@ -557,5 +578,34 @@ mod tests {
             .await
             .expect("finish must observe the stored cancel permit");
         assert!(res.is_err(), "pre-sent cancel should still abort finish");
+        session.kill().await; // 念のため子プロセスを回収。
+    }
+
+    /// PR #16 レビュー対応: finish 成功とほぼ同時の遅延キャンセルが、生成済みの
+    /// 正しい出力を消さないこと。completed=true なら discard はファイルを残し、
+    /// completed=false (= 中断/失敗) なら部分出力を消す。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discard_keeps_completed_output_removes_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // completed=true → 出力を残す。
+        let mut done = session_with_long_child();
+        let kept = dir.path().join("kept.mp4");
+        std::fs::write(&kept, b"ok").expect("write kept");
+        done.output_path = kept.clone();
+        done.completed = true;
+        done.discard_if_incomplete().await;
+        assert!(kept.exists(), "completed output must be kept");
+        done.kill().await; // 残った子プロセスを回収。
+
+        // completed=false → 部分出力を削除。
+        let mut partial = session_with_long_child();
+        let gone = dir.path().join("partial.mp4");
+        std::fs::write(&gone, b"partial").expect("write partial");
+        partial.output_path = gone.clone();
+        partial.completed = false;
+        partial.discard_if_incomplete().await;
+        assert!(!gone.exists(), "incomplete output must be removed");
     }
 }
