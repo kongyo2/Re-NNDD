@@ -1019,54 +1019,62 @@ pub async fn fetch_series_videos(
     // series_id は数値のみ。URL へ埋め込む前に検証して注入を防ぐ。
     validate_owner_id(&series_id)?;
     let client = build_nv_client()?;
+    let cookie = store.cookie_header();
 
-    // Step 1: nvapi /v1/series/{id} はシリーズメタと動画一覧を一度に返す。
-    // ここで動画一覧まで取れれば yt-dlp 起動も HTML スクレイプも不要で、
-    // サムネ・再生数・コメ数・投稿日まで揃う。メタ取得自体は失敗しても致命では
-    // ないので 4xx は Null で握り潰し、Step2/3 のフォールバックへ進む。
-    let meta_url = format!(
-        "https://nvapi.nicovideo.jp/v1/series/{series_id}?page={page}&pageSize={page_size}"
-    );
-    let meta_json = match nv_get_json(
-        &client,
-        &meta_url,
-        store.cookie_header(),
-        "シリーズメタ API エラー",
-    )
-    .await
-    {
-        Ok((j, _)) => j,
-        Err(_) => serde_json::Value::Null,
+    // Step 1: nvapi /v2/series/{id} はシリーズメタと動画一覧を一度に返す
+    // (niconico Web / yt-dlp が読むのと同じ正規の一覧エンドポイント)。動画一覧まで
+    // 取れれば yt-dlp 起動も HTML スクレイプも不要で、サムネ・再生数・コメ数・
+    // 投稿日まで揃う。メタ取得自体は失敗しても致命ではないので、その時は
+    // Step2/3 のフォールバックへ進む。
+    let start_page = page.max(1);
+    let batch = page_size.clamp(1, 100);
+    let first = fetch_series_page_nvapi(&client, &series_id, start_page, batch, cookie.clone()).await;
+
+    let (series_title, series_description, series_thumbnail_url) = match &first {
+        Ok((json, _, _)) => {
+            let detail = &json["data"]["detail"];
+            (
+                detail["title"].as_str().map(String::from),
+                detail["description"].as_str().map(String::from),
+                detail["thumbnailUrl"]
+                    .as_str()
+                    .or_else(|| detail["thumbnail"]["url"].as_str())
+                    .map(String::from),
+            )
+        }
+        Err(_) => (None, None, None),
     };
 
-    let detail = &meta_json["data"]["detail"];
-    let series_title = detail["title"].as_str().map(String::from);
-    let series_description = detail["description"].as_str().map(String::from);
-    let series_thumbnail_url = detail["thumbnailUrl"]
-        .as_str()
-        .or_else(|| detail["thumbnail"]["url"].as_str())
-        .map(String::from);
-
-    // nvapi が動画一覧を返したら最優先で採用する。yt-dlp --flat-playlist は
-    // thumbnail を URL 配列で返すうえ再生数等のカウンタを一切持たないため、
-    // サムネが欠落 (= プレースホルダの黒枠) し、カウンタも空欄になってしまう。
-    let nv_items = extract_series_items_from_nvapi(&meta_json);
-    if !nv_items.is_empty() {
-        let total_count = meta_json["data"]["totalCount"]
-            .as_i64()
-            .unwrap_or(nv_items.len() as i64);
-        return Ok(UserVideosResponse {
-            total_count,
-            items: nv_items,
-            debug_raw: None,
-            series_title,
-            series_description,
-            series_thumbnail_url,
-        });
+    if let Ok((_, total_count, mut items)) = first {
+        if !items.is_empty() {
+            // フロントは 1 ページ (pageSize=100) しか要求しないが、旧 yt-dlp 経路は
+            // プレイリスト全件を返していた。100 本超のシリーズが黙って切り詰められ
+            // ないよう、totalCount に達するまで残りページをここで集約する。暴走防止に
+            // 取得ページ数の上限を設ける。
+            const MAX_PAGES: u32 = 50;
+            let mut next = start_page + 1;
+            while (items.len() as i64) < total_count && next < start_page + MAX_PAGES {
+                match fetch_series_page_nvapi(&client, &series_id, next, batch, cookie.clone()).await
+                {
+                    Ok((_, _, more)) if !more.is_empty() => {
+                        items.extend(more);
+                        next += 1;
+                    }
+                    _ => break,
+                }
+            }
+            return Ok(UserVideosResponse {
+                total_count,
+                items,
+                debug_raw: None,
+                series_title,
+                series_description,
+                series_thumbnail_url,
+            });
+        }
     }
 
     // Step 2: try yt-dlp for video list (fallback)
-    let cookie = store.cookie_header();
     match fetch_series_videos_via_ytdlp(&series_id, cookie).await {
         Ok(items) if !items.is_empty() => {
             let total_count = items.len() as i64;
@@ -1130,7 +1138,24 @@ pub async fn fetch_series_videos(
     })
 }
 
-/// nvapi `/v1/series/{id}` レスポンス (`data.items[].video`) から動画一覧を作る。
+/// nvapi `/v2/series/{id}` の 1 ページを取得し `(生 JSON, totalCount, items)` を返す。
+/// JSON にはシリーズメタ (`data.detail`) も含まれるので呼び出し側はタイトル等も拾える。
+async fn fetch_series_page_nvapi(
+    client: &reqwest::Client,
+    series_id: &str,
+    page: u32,
+    page_size: u32,
+    cookie: Option<String>,
+) -> Result<(serde_json::Value, i64, Vec<UserVideoItem>)> {
+    let url =
+        format!("https://nvapi.nicovideo.jp/v2/series/{series_id}?page={page}&pageSize={page_size}");
+    let (json, _body) = nv_get_json(client, &url, cookie, "シリーズ API エラー").await?;
+    let total_count = json["data"]["totalCount"].as_i64().unwrap_or(0);
+    let items = extract_series_items_from_nvapi(&json);
+    Ok((json, total_count, items))
+}
+
+/// nvapi `/v2/series/{id}` レスポンス (`data.items[].video`) から動画一覧を作る。
 /// 各 `video` ノードはユーザー動画 API / マイリスト動画 API と同じ形なので
 /// `build_user_video_item` にそのまま委譲でき、サムネ・再生数・コメ数・投稿日まで
 /// 埋まる。items が無い (= 取得失敗 or 旧スキーマ) なら空を返し、呼び出し側は
