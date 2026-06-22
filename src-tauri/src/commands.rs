@@ -1012,15 +1012,21 @@ pub async fn fetch_user_videos(
 #[tauri::command]
 pub async fn fetch_series_videos(
     series_id: String,
-    _page: u32,
-    _page_size: u32,
+    page: u32,
+    page_size: u32,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<UserVideosResponse> {
+    // series_id は数値のみ。URL へ埋め込む前に検証して注入を防ぐ。
+    validate_owner_id(&series_id)?;
     let client = build_nv_client()?;
 
-    // Step 1: get series metadata from NV API. メタ取得は失敗しても致命的じゃ
-    // ないので 4xx でも Null で先へ進む (Step2/3 が動画一覧を別経路で取りに行く)。
-    let meta_url = format!("https://nvapi.nicovideo.jp/v1/series/{series_id}");
+    // Step 1: nvapi /v1/series/{id} はシリーズメタと動画一覧を一度に返す。
+    // ここで動画一覧まで取れれば yt-dlp 起動も HTML スクレイプも不要で、
+    // サムネ・再生数・コメ数・投稿日まで揃う。メタ取得自体は失敗しても致命では
+    // ないので 4xx は Null で握り潰し、Step2/3 のフォールバックへ進む。
+    let meta_url = format!(
+        "https://nvapi.nicovideo.jp/v1/series/{series_id}?page={page}&pageSize={page_size}"
+    );
     let meta_json = match nv_get_json(
         &client,
         &meta_url,
@@ -1033,18 +1039,33 @@ pub async fn fetch_series_videos(
         Err(_) => serde_json::Value::Null,
     };
 
-    let series_title = meta_json["data"]["detail"]["title"]
+    let detail = &meta_json["data"]["detail"];
+    let series_title = detail["title"].as_str().map(String::from);
+    let series_description = detail["description"].as_str().map(String::from);
+    let series_thumbnail_url = detail["thumbnailUrl"]
         .as_str()
-        .map(String::from);
-    let series_description = meta_json["data"]["detail"]["description"]
-        .as_str()
-        .map(String::from);
-    let series_thumbnail_url = meta_json["data"]["detail"]["thumbnailUrl"]
-        .as_str()
-        .or_else(|| meta_json["data"]["detail"]["thumbnail"]["url"].as_str())
+        .or_else(|| detail["thumbnail"]["url"].as_str())
         .map(String::from);
 
-    // Step 2: try yt-dlp for video list (most reliable)
+    // nvapi が動画一覧を返したら最優先で採用する。yt-dlp --flat-playlist は
+    // thumbnail を URL 配列で返すうえ再生数等のカウンタを一切持たないため、
+    // サムネが欠落 (= プレースホルダの黒枠) し、カウンタも空欄になってしまう。
+    let nv_items = extract_series_items_from_nvapi(&meta_json);
+    if !nv_items.is_empty() {
+        let total_count = meta_json["data"]["totalCount"]
+            .as_i64()
+            .unwrap_or(nv_items.len() as i64);
+        return Ok(UserVideosResponse {
+            total_count,
+            items: nv_items,
+            debug_raw: None,
+            series_title,
+            series_description,
+            series_thumbnail_url,
+        });
+    }
+
+    // Step 2: try yt-dlp for video list (fallback)
     let cookie = store.cookie_header();
     match fetch_series_videos_via_ytdlp(&series_id, cookie).await {
         Ok(items) if !items.is_empty() => {
@@ -1109,6 +1130,47 @@ pub async fn fetch_series_videos(
     })
 }
 
+/// nvapi `/v1/series/{id}` レスポンス (`data.items[].video`) から動画一覧を作る。
+/// 各 `video` ノードはユーザー動画 API / マイリスト動画 API と同じ形なので
+/// `build_user_video_item` にそのまま委譲でき、サムネ・再生数・コメ数・投稿日まで
+/// 埋まる。items が無い (= 取得失敗 or 旧スキーマ) なら空を返し、呼び出し側は
+/// yt-dlp / HTML スクレイプのフォールバックへ進む。
+fn extract_series_items_from_nvapi(meta_json: &serde_json::Value) -> Vec<UserVideoItem> {
+    let Some(items_val) = meta_json["data"]["items"].as_array() else {
+        return Vec::new();
+    };
+    let parse_id = |value: &serde_json::Value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+    };
+    let mut items = Vec::with_capacity(items_val.len());
+    for raw_item in items_val {
+        // シリーズ API は各エントリを { meta, video } で包む。
+        let v = if raw_item["video"].is_object() {
+            &raw_item["video"]
+        } else {
+            raw_item
+        };
+        let id = json_value_as_id_string(&v["id"])
+            .or_else(|| v["contentId"].as_str().map(String::from))
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let uid = parse_id(&v["owner"]["id"]).or_else(|| parse_id(&v["userId"]));
+        let cid = if v["owner"]["ownerType"].as_str() == Some("channel")
+            || v["owner"]["type"].as_str() == Some("channel")
+        {
+            parse_id(&v["owner"]["id"])
+        } else {
+            None
+        };
+        items.push(build_user_video_item(v, id, uid, cid));
+    }
+    items
+}
+
 /// Fallback: scrape server-response meta from series HTML page.
 /// Only works if the series page embeds video data in the same pattern
 /// as the watch page (unlikely for modern niconico series pages).
@@ -1165,6 +1227,25 @@ fn extract_series_videos_from_html(html: &str) -> Vec<UserVideoItem> {
     }
 
     items
+}
+
+/// yt-dlp の `--flat-playlist` は動画によって `thumbnail` を文字列で返したり
+/// URL 配列で返したりする (niconico:series は配列で返す)。配列の場合は署名付き
+/// (`?key=` 付きで失効しうる) を避け、安定した素の URL を優先して 1 本選ぶ。
+/// これを怠ると `as_str()` が None になりサムネが丸ごと欠落する。
+fn pick_ytdlp_thumbnail(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    let arr = value.as_array()?;
+    let candidates: Vec<&str> = arr.iter().filter_map(|t| t.as_str()).collect();
+    // 末尾側 (= 素直な無印 URL) かつ署名なしを優先。無ければ最後の候補。
+    candidates
+        .iter()
+        .rev()
+        .find(|s| !s.contains("?key="))
+        .or_else(|| candidates.last())
+        .map(|s| s.to_string())
 }
 
 /// Use yt-dlp --dump-json --flat-playlist to list series videos.
@@ -1250,10 +1331,8 @@ async fn fetch_series_videos_via_ytdlp(
             continue;
         }
         let title = json["title"].as_str().unwrap_or("(無題)").to_string();
-        let thumbnail_url = json["thumbnail"]
-            .as_str()
-            .or_else(|| json["thumbnail_url"].as_str())
-            .map(String::from);
+        let thumbnail_url = pick_ytdlp_thumbnail(&json["thumbnail"])
+            .or_else(|| json["thumbnail_url"].as_str().map(String::from));
         let duration = json["duration"]
             .as_i64()
             .or_else(|| json["duration_string"].as_i64());
@@ -3905,6 +3984,84 @@ mod tests {
             None
         );
         assert_eq!(parse_thumbnail_url_from_xml(""), None);
+    }
+
+    #[test]
+    fn extract_series_items_from_nvapi_builds_full_items() {
+        // nvapi /v1/series/{id} は { meta, video } で各動画を包む。video ノードから
+        // サムネ・再生数・コメ数・投稿日まで取り出せる事を保証する回帰テスト。
+        // (旧実装は yt-dlp 経由だったためサムネ欠落 + カウンタ空欄になっていた)
+        let json = serde_json::json!({
+            "data": {
+                "totalCount": 1,
+                "items": [{
+                    "meta": { "id": "sm44595342", "order": 1 },
+                    "video": {
+                        "id": "sm44595342",
+                        "title": "パタポンごっこヒメミコ",
+                        "registeredAt": "2025-01-31T00:00:00+09:00",
+                        "count": { "view": 1002, "comment": 32, "mylist": 8, "like": 128 },
+                        "duration": 47,
+                        "thumbnail": { "url": "https://nicovideo.cdn.nimg.jp/thumbnails/44595342/44595342.27040807" },
+                        "owner": { "ownerType": "user", "type": "user", "id": "34013689" }
+                    }
+                }]
+            }
+        });
+        let items = extract_series_items_from_nvapi(&json);
+        assert_eq!(items.len(), 1);
+        let it = &items[0];
+        assert_eq!(it.content_id, "sm44595342");
+        assert_eq!(it.title, "パタポンごっこヒメミコ");
+        assert_eq!(
+            it.thumbnail_url.as_deref(),
+            Some("https://nicovideo.cdn.nimg.jp/thumbnails/44595342/44595342.27040807")
+        );
+        assert_eq!(it.length_seconds, Some(47));
+        assert_eq!(it.view_counter, Some(1002));
+        assert_eq!(it.comment_counter, Some(32));
+        assert_eq!(it.mylist_counter, Some(8));
+        assert_eq!(it.start_time.as_deref(), Some("2025-01-31T00:00:00+09:00"));
+        assert_eq!(it.user_id, Some(34013689));
+        assert_eq!(it.channel_id, None);
+    }
+
+    #[test]
+    fn extract_series_items_from_nvapi_handles_missing_items() {
+        // メタ取得失敗 (Null) や items 不在では空を返し、フォールバックへ委ねる。
+        assert!(extract_series_items_from_nvapi(&serde_json::Value::Null).is_empty());
+        let no_items = serde_json::json!({ "data": { "detail": { "title": "x" } } });
+        assert!(extract_series_items_from_nvapi(&no_items).is_empty());
+    }
+
+    #[test]
+    fn pick_ytdlp_thumbnail_handles_string_and_array() {
+        // 文字列はそのまま。
+        let s = serde_json::json!("https://nicovideo.cdn.nimg.jp/thumbnails/9/9");
+        assert_eq!(
+            pick_ytdlp_thumbnail(&s).as_deref(),
+            Some("https://nicovideo.cdn.nimg.jp/thumbnails/9/9")
+        );
+        // niconico:series は配列で返す。署名付き(?key=)を避け素の URL を選ぶ。
+        let arr = serde_json::json!([
+            "https://img.cdn.nimg.jp/s/nicovideo/thumbnails/9/9.original/r640x360l?key=deadbeef",
+            "https://nicovideo.cdn.nimg.jp/thumbnails/9/9.L",
+            "https://nicovideo.cdn.nimg.jp/thumbnails/9/9.M",
+            "https://nicovideo.cdn.nimg.jp/thumbnails/9/9"
+        ]);
+        assert_eq!(
+            pick_ytdlp_thumbnail(&arr).as_deref(),
+            Some("https://nicovideo.cdn.nimg.jp/thumbnails/9/9")
+        );
+        // 署名付きしか無ければ最後の候補にフォールバック。
+        let only_signed = serde_json::json!(["https://x/a?key=1", "https://x/b?key=2"]);
+        assert_eq!(
+            pick_ytdlp_thumbnail(&only_signed).as_deref(),
+            Some("https://x/b?key=2")
+        );
+        // 空配列・非文字列は None。
+        assert_eq!(pick_ytdlp_thumbnail(&serde_json::json!([])), None);
+        assert_eq!(pick_ytdlp_thumbnail(&serde_json::Value::Null), None);
     }
 
     #[test]
