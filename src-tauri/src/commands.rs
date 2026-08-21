@@ -57,6 +57,17 @@ impl DownloadTasks {
             tasks.remove(&id);
         }
     }
+
+    /// 走っている DL が 1 本も無いか。
+    ///
+    /// yt-dlp の実行ファイルを差し替える前に確認する。DL 中に入れ替えると
+    /// Windows では実行中イメージへの rename が失敗し、Unix でも 1 本の
+    /// ジョブの途中で挙動が変わりかねない。
+    ///
+    /// ロックが毒化していたら「走っているかも」に倒す (安全側)。
+    pub fn is_idle(&self) -> bool {
+        self.inner.lock().map(|t| t.is_empty()).unwrap_or(false)
+    }
 }
 
 #[tauri::command]
@@ -1015,6 +1026,7 @@ pub async fn fetch_series_videos(
     page: u32,
     page_size: u32,
     store: State<'_, Arc<SessionStore>>,
+    app: tauri::AppHandle,
 ) -> Result<UserVideosResponse> {
     // series_id は数値のみ。URL へ埋め込む前に検証して注入を防ぐ。
     validate_owner_id(&series_id)?;
@@ -1077,7 +1089,7 @@ pub async fn fetch_series_videos(
     }
 
     // Step 2: try yt-dlp for video list (fallback)
-    match fetch_series_videos_via_ytdlp(&series_id, cookie).await {
+    match fetch_series_videos_via_ytdlp(&series_id, cookie, Some(&app)).await {
         Ok(items) if !items.is_empty() => {
             let total_count = items.len() as i64;
             return Ok(UserVideosResponse {
@@ -1281,8 +1293,11 @@ fn pick_ytdlp_thumbnail(value: &serde_json::Value) -> Option<String> {
 async fn fetch_series_videos_via_ytdlp(
     series_id: &str,
     cookie_header: Option<String>,
+    app: Option<&tauri::AppHandle>,
 ) -> Result<Vec<UserVideoItem>, AppError> {
-    let yt = tools::ytdlp(None);
+    // `app` を渡さないと managed / bundled が見えず PATH の yt-dlp に落ちる
+    // (= 同梱版もアップデート済みの版も無視される) ので必ず AppHandle 経由で解決する。
+    let yt = tools::ytdlp(app);
     if matches!(yt.source, tools::BinarySource::NotFound) {
         return Err(AppError::Other(
             "yt-dlp が見つかりません。インストールしてください。".into(),
@@ -3476,18 +3491,9 @@ pub async fn get_app_info(
     let ff = crate::downloader::tools::ffmpeg(Some(&app));
     let (ytdlp_available, ytdlp_version) = check_tool_version(&yt.command, "--version").await;
     let (ffmpeg_available, ffmpeg_version) = check_tool_version(&ff.command, "-version").await;
-    let yt_source = match yt.source {
-        crate::downloader::tools::BinarySource::Bundled => "bundled",
-        crate::downloader::tools::BinarySource::Sidecar => "sidecar",
-        crate::downloader::tools::BinarySource::SystemPath => "system_path",
-        crate::downloader::tools::BinarySource::NotFound => "not_found",
-    };
-    let ff_source = match ff.source {
-        crate::downloader::tools::BinarySource::Bundled => "bundled",
-        crate::downloader::tools::BinarySource::Sidecar => "sidecar",
-        crate::downloader::tools::BinarySource::SystemPath => "system_path",
-        crate::downloader::tools::BinarySource::NotFound => "not_found",
-    };
+    // 識別子は `BinarySource::as_str` に一本化してある (`managed` の追加漏れ防止)。
+    let yt_source = yt.source.as_str();
+    let ff_source = ff.source.as_str();
 
     let (count, size) = {
         let conn = library.lock().await;

@@ -12,6 +12,7 @@ use tauri::Manager;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::api::auth::SessionStore;
+use crate::downloader::ytdlp_update::YtdlpUpdateState;
 use crate::library::db::LibraryHandle;
 use crate::local_server::LocalServer;
 use crate::plugins::runtime::PluginRuntime;
@@ -34,12 +35,15 @@ pub fn run() {
     let session = Arc::new(SessionStore::default());
 
     let plugin_runtime: Arc<PluginRuntime> = Arc::new(PluginRuntime::default());
+    let ytdlp_update: Arc<YtdlpUpdateState> = Arc::new(YtdlpUpdateState::default());
+    let download_tasks = commands::DownloadTasks::default();
 
     if let Err(err) = tauri::Builder::default()
         .manage(Arc::clone(&session))
-        .manage(commands::DownloadTasks::default())
+        .manage(download_tasks.clone())
         .manage(crate::downloader::burnin::BurnInSessions::default())
         .manage(Arc::clone(&plugin_runtime))
+        .manage(Arc::clone(&ytdlp_update))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
@@ -88,6 +92,18 @@ pub fn run() {
             // ランタイム初期ロード。DB を真値として PluginEntry を populate する。
             // 内部で warn ログを出すので戻り値はない。
             crate::plugins::bootstrap_blocking(&plugin_runtime, &library);
+
+            // yt-dlp のアップデート追従。niconico の仕様変更に追いつけるのは
+            // yt-dlp 側なので、同梱版が古いままにならないよう起動時に一度
+            // 様子を見る (既定は「調べて記録するだけ」。実際に入れるかは
+            // 設定画面 / `ytdlp.auto_install` 次第)。
+            // 失敗しても起動は止めない。
+            crate::downloader::ytdlp_update::spawn_auto_check(
+                app.handle().clone(),
+                Arc::clone(&library),
+                ytdlp_update,
+                download_tasks,
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -157,6 +173,11 @@ pub fn run() {
             commands::fetch_video_html,
             commands::fetch_related_videos,
             commands::resolve_thumbnail_url,
+            // ----- yt-dlp アップデート追従 -----
+            downloader::ytdlp_update::ytdlp_check_update,
+            downloader::ytdlp_update::ytdlp_install_update,
+            downloader::ytdlp_update::ytdlp_update_status,
+            downloader::ytdlp_update::ytdlp_remove_managed,
             // ----- プラグイン (フロント拡張機能) -----
             plugins::commands::plugin_list_installed,
             plugins::commands::plugin_get_manifest,

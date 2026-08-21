@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import {
     clearSessionCookie,
     getAppInfo,
@@ -7,8 +7,16 @@
     loginPassword,
     saveSessionCookie,
     sessionCookieStatus,
+    ytdlpCheckUpdate,
+    ytdlpInstallUpdate,
+    ytdlpRemoveManaged,
+    ytdlpUpdateStatus,
     type AppInfo,
     type LoginResult,
+    type YtdlpChannel,
+    type YtdlpUpdateCheck,
+    type YtdlpUpdatePhase,
+    type YtdlpUpdateProgress,
   } from '$lib/api';
   import {
     SETTING_DEFS,
@@ -344,6 +352,8 @@
 
   function sourceLabel(s: string): string {
     switch (s) {
+      case 'managed':
+        return 'アップデート済';
       case 'bundled':
         return 'バンドル済';
       case 'sidecar':
@@ -362,6 +372,147 @@
     if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
     return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
   }
+
+  // ========= yt-dlp アップデート =========
+  //
+  // niconico の仕様変更に追従しているのは yt-dlp 側なので、同梱版が古いままだと
+  // アプリごと DL 不能になる。アプリのリリースを待たずにここから更新できる。
+  //
+  // インストール中の進捗は Rust 側の共有状態を 500ms ポーリングして読む
+  // (このアプリの DL キューと同じ流儀。Tauri イベントは使っていない)。
+
+  let ytdlpCheck = $state<YtdlpUpdateCheck | null>(null);
+  let ytdlpChecking = $state(false);
+  let ytdlpInstalling = $state(false);
+  let ytdlpProgress = $state<YtdlpUpdateProgress | null>(null);
+  let ytdlpMessage = $state<{ kind: 'ok' | 'warn' | 'error'; text: string } | null>(null);
+  let ytdlpPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** 設定画面で今選ばれているチャンネル (DB 書き込み待ちに依存しないよう明示的に渡す)。 */
+  const ytdlpChannel = $derived(get('ytdlp.update_channel') as YtdlpChannel);
+
+  // 起動時の自動チェックが settings に書き残した結果。ページを開いただけで
+  // ネットワークを叩かずに「前回いつ・何が見えたか」を出せる。
+  // チェック / インストール後は `ytdlpCheck` の値で上書き表示する。
+  const latestKnownVersion = $derived(
+    ytdlpCheck?.latestVersion ?? getRawSetting('ytdlp.latest_known_version') ?? null,
+  );
+  const lastCheckedLabel = $derived.by(() => {
+    const raw = ytdlpCheck?.lastCheckedAt ?? Number(getRawSetting('ytdlp.last_checked_at') ?? NaN);
+    if (!Number.isFinite(raw) || raw <= 0) return null;
+    // Rust 側は Unix 秒で書いている。
+    return new Date(raw * 1000).toLocaleString();
+  });
+
+  const YTDLP_PHASE_LABELS: Record<YtdlpUpdatePhase, string> = {
+    idle: '待機中',
+    checking: '最新版を確認中…',
+    downloading: 'ダウンロード中…',
+    verifying: '検証中…',
+    installing: '設置中…',
+    done: '完了',
+    error: 'エラー',
+  };
+
+  function stopYtdlpPolling() {
+    if (ytdlpPollTimer !== null) {
+      clearInterval(ytdlpPollTimer);
+      ytdlpPollTimer = null;
+    }
+  }
+
+  /**
+   * 最新版を調べ直して表示を更新する。
+   *
+   * `quiet` を立てると結果メッセージを書かない。インストール / 削除の直後に
+   * 表示を揃えるために呼ぶときは、せっかく出した「インストールしました」を
+   * 「yt-dlp は最新です。」で潰さないよう必ず `quiet` で呼ぶこと。
+   */
+  async function refreshYtdlpCheck(options?: { quiet?: boolean }) {
+    const quiet = options?.quiet ?? false;
+    ytdlpChecking = true;
+    if (!quiet) ytdlpMessage = null;
+    try {
+      ytdlpCheck = await ytdlpCheckUpdate(ytdlpChannel);
+      if (quiet) return;
+      if (ytdlpCheck.error) {
+        ytdlpMessage = {
+          kind: 'warn',
+          text: `最新版を確認できませんでした: ${ytdlpCheck.error}`,
+        };
+      } else if (ytdlpCheck.updateAvailable) {
+        ytdlpMessage = {
+          kind: 'warn',
+          text: `新しい yt-dlp があります: ${ytdlpCheck.latestVersion}`,
+        };
+      } else {
+        ytdlpMessage = { kind: 'ok', text: 'yt-dlp は最新です。' };
+      }
+    } catch (e) {
+      // quiet でも失敗は伝える (表示が古いままになるので)。
+      ytdlpMessage = { kind: 'error', text: `確認に失敗しました: ${e}` };
+    } finally {
+      ytdlpChecking = false;
+    }
+  }
+
+  async function handleYtdlpInstall() {
+    if (ytdlpInstalling) return;
+    ytdlpInstalling = true;
+    ytdlpMessage = null;
+    ytdlpProgress = {
+      phase: 'checking',
+      downloadedBytes: 0,
+      totalBytes: null,
+      version: null,
+      message: null,
+    };
+    // 進捗ポーリング開始。invoke の解決を待たずに回すことで、DL 中も UI が動く。
+    stopYtdlpPolling();
+    ytdlpPollTimer = setInterval(() => {
+      void ytdlpUpdateStatus()
+        .then((p) => {
+          ytdlpProgress = p;
+        })
+        .catch(() => {
+          /* ポーリング失敗は握り潰す (本体の invoke がエラーを返す) */
+        });
+    }, 500);
+    try {
+      const result = await ytdlpInstallUpdate(ytdlpChannel);
+      // 解決結果は Rust 側で invalidate 済み。表示も新しいパス/版に揃える。
+      // 結果メッセージはこの後に出す (quiet 無しだと「最新です」で潰される)。
+      await Promise.all([refreshAppInfo(), refreshYtdlpCheck({ quiet: true })]);
+      ytdlpMessage = {
+        kind: 'ok',
+        text:
+          `yt-dlp ${result.version} をインストールしました ` +
+          `(${formatBytes(result.bytes)}${result.sha256Verified ? ' / SHA-256 照合済' : ' / ハッシュ未照合'})`,
+      };
+    } catch (e) {
+      ytdlpMessage = { kind: 'error', text: `インストールに失敗しました: ${e}` };
+    } finally {
+      stopYtdlpPolling();
+      ytdlpInstalling = false;
+      ytdlpProgress = null;
+    }
+  }
+
+  async function handleYtdlpRemoveManaged() {
+    ytdlpMessage = null;
+    try {
+      const removed = await ytdlpRemoveManaged();
+      // インストール時と同じ理由で、表示を揃えてから結果を出す。
+      await Promise.all([refreshAppInfo(), refreshYtdlpCheck({ quiet: true })]);
+      ytdlpMessage = removed
+        ? { kind: 'ok', text: 'アップデート版を削除し、同梱版に戻しました。' }
+        : { kind: 'warn', text: '削除するアップデート版はありませんでした。' };
+    } catch (e) {
+      ytdlpMessage = { kind: 'error', text: `削除に失敗しました: ${e}` };
+    }
+  }
+
+  onDestroy(stopYtdlpPolling);
 </script>
 
 <section class="page">
@@ -703,6 +854,143 @@
     </details>
   </div>
 
+  <!-- yt-dlp アップデート -->
+  <div class="card">
+    <header>
+      <h3>yt-dlp のアップデート</h3>
+      <p class="hint">
+        niconico の仕様変更に追従しているのは yt-dlp 側です。同梱版が古くなると
+        ダウンロードが失敗し始めるので、アプリの更新を待たずにここから yt-dlp だけ
+        入れ替えられます。インストール先は
+        <code>&lt;データ保存場所&gt;/bin/</code> で、同梱版より優先して使われます。
+      </p>
+    </header>
+
+    {#if ytdlpMessage}
+      <div class="msg {ytdlpMessage.kind}">{ytdlpMessage.text}</div>
+    {/if}
+
+    <dl class="info-grid">
+      <dt>現在の版</dt>
+      <dd>
+        {#if ytdlpCheck}
+          {#if ytdlpCheck.currentVersion}
+            <span class="ok">{ytdlpCheck.currentVersion}</span>
+          {:else}
+            <span class="error-text">未検出</span>
+          {/if}
+          <span class="src-badge src-{ytdlpCheck.currentSource}"
+            >{sourceLabel(ytdlpCheck.currentSource)}</span
+          >
+          <code class="path-tiny">{ytdlpCheck.currentPath}</code>
+        {:else if appInfo}
+          {#if appInfo.ytdlpAvailable}
+            <span class="ok">{appInfo.ytdlpVersion ?? '検出'}</span>
+          {:else}
+            <span class="error-text">未検出</span>
+          {/if}
+          <span class="src-badge src-{appInfo.ytdlpSource}">{sourceLabel(appInfo.ytdlpSource)}</span
+          >
+          <code class="path-tiny">{appInfo.ytdlpPath}</code>
+        {:else}
+          <span class="muted">取得中…</span>
+        {/if}
+      </dd>
+
+      <dt>最新の版</dt>
+      <dd>
+        {#if ytdlpCheck?.latestVersion}
+          {ytdlpCheck.latestVersion}
+          {#if ytdlpCheck.updateAvailable}
+            <span class="src-badge src-not_found">更新あり</span>
+          {:else}
+            <span class="src-badge src-bundled">最新</span>
+          {/if}
+        {:else if latestKnownVersion}
+          <span class="muted">{latestKnownVersion}（前回の確認結果）</span>
+        {:else}
+          <span class="muted">未確認</span>
+        {/if}
+      </dd>
+
+      <dt>チャンネル</dt>
+      <dd>
+        {ytdlpChannel === 'nightly' ? '毎日ビルド (nightly)' : '安定版 (stable)'}
+        <span class="path-tiny"> 「ダウンロード」セクションの設定で切り替えられます。 </span>
+      </dd>
+
+      <dt>最終確認</dt>
+      <dd>
+        {#if lastCheckedLabel}
+          {lastCheckedLabel}
+        {:else}
+          <span class="muted">まだ確認していません</span>
+        {/if}
+      </dd>
+    </dl>
+
+    {#if ytdlpCheck?.fallbackIsNewer}
+      <div class="msg warn">
+        同梱されている yt-dlp ({ytdlpCheck.fallbackVersion}) の方が、アップデートで入れた版 ({ytdlpCheck.currentVersion})
+        より新しくなっています。「同梱版に戻す」を 押すと同梱版が使われるようになります。
+      </div>
+    {/if}
+
+    {#if ytdlpInstalling && ytdlpProgress}
+      <div class="ytdlp-progress">
+        <div class="ytdlp-progress-head">
+          <span>{YTDLP_PHASE_LABELS[ytdlpProgress.phase] ?? ytdlpProgress.phase}</span>
+          {#if ytdlpProgress.version}<span class="muted">{ytdlpProgress.version}</span>{/if}
+        </div>
+        {#if ytdlpProgress.phase === 'downloading'}
+          <progress
+            max={ytdlpProgress.totalBytes ?? undefined}
+            value={ytdlpProgress.totalBytes ? ytdlpProgress.downloadedBytes : undefined}
+          ></progress>
+          <span class="path-tiny">
+            {formatBytes(ytdlpProgress.downloadedBytes)}
+            {#if ytdlpProgress.totalBytes}/ {formatBytes(ytdlpProgress.totalBytes)}{/if}
+          </span>
+        {/if}
+      </div>
+    {/if}
+
+    <div class="actions">
+      <button
+        type="button"
+        class="primary"
+        onclick={() => refreshYtdlpCheck()}
+        disabled={ytdlpChecking || ytdlpInstalling}
+      >
+        {ytdlpChecking ? '確認中…' : '更新を確認'}
+      </button>
+      <button
+        type="button"
+        class="primary"
+        onclick={handleYtdlpInstall}
+        disabled={ytdlpInstalling || ytdlpChecking || !ytdlpCheck?.updateAvailable}
+      >
+        {ytdlpInstalling ? 'インストール中…' : '最新版をインストール'}
+      </button>
+      {#if ytdlpCheck?.managedInstalled}
+        <button
+          type="button"
+          class="link danger"
+          onclick={handleYtdlpRemoveManaged}
+          disabled={ytdlpInstalling || ytdlpChecking}
+        >
+          同梱版に戻す
+        </button>
+      {/if}
+    </div>
+
+    {#if ytdlpCheck?.releaseUrl}
+      <p class="hint">
+        リリースノート: <code>{ytdlpCheck.releaseUrl}</code>
+      </p>
+    {/if}
+  </div>
+
   <!-- アプリ情報 -->
   <div class="card">
     <header>
@@ -1038,6 +1326,11 @@
     color: var(--theme-success-text);
     border: 1px solid var(--theme-success-border);
   }
+  .src-managed {
+    background: var(--theme-accent-bg);
+    color: var(--theme-accent-soft);
+    border: 1px solid var(--theme-accent-border);
+  }
   .src-sidecar {
     background: var(--theme-accent-bg);
     color: var(--theme-accent-soft);
@@ -1058,6 +1351,22 @@
     font-size: 10px;
     margin-top: 4px;
     color: var(--theme-text-muted);
+  }
+  .ytdlp-progress {
+    margin: 12px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ytdlp-progress-head {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 13px;
+  }
+  .ytdlp-progress progress {
+    width: 100%;
+    height: 6px;
   }
   code {
     background: var(--theme-bg);

@@ -41,6 +41,10 @@ base64 = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "form"] }
 url = "2"
 
+# yt-dlp アップデートの整合性チェック (リリース同梱 SHA2-256SUMS との照合)。
+# rustls / aes 経由で既に依存グラフに入っているので、実質的な追加コストは無い。
+sha2 = "0.10"
+
 # Persistence
 rusqlite = { version = "0.40", features = ["bundled", "serde_json"] }
 

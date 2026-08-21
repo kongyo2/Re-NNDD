@@ -749,6 +749,9 @@ export async function deletePlayHistoryItem(id: number): Promise<boolean> {
   return invoke<boolean>('delete_play_history_item', { id });
 }
 
+/** yt-dlp / ffmpeg をどこから見つけたか。Rust 側 `BinarySource::as_str` と対。 */
+export type BinarySource = 'managed' | 'bundled' | 'sidecar' | 'system_path' | 'not_found';
+
 export type AppInfo = {
   version: string;
   identifier: string;
@@ -758,11 +761,11 @@ export type AppInfo = {
   localServerPort: number;
   ytdlpAvailable: boolean;
   ytdlpVersion: string | null;
-  ytdlpSource: 'bundled' | 'sidecar' | 'system_path' | 'not_found';
+  ytdlpSource: BinarySource;
   ytdlpPath: string;
   ffmpegAvailable: boolean;
   ffmpegVersion: string | null;
-  ffmpegSource: 'bundled' | 'sidecar' | 'system_path' | 'not_found';
+  ffmpegSource: BinarySource;
   ffmpegPath: string;
   libraryVideoCount: number;
   libraryVideosSizeBytes: number;
@@ -770,4 +773,80 @@ export type AppInfo = {
 
 export async function getAppInfo(): Promise<AppInfo> {
   return invoke<AppInfo>('get_app_info');
+}
+
+// =================== yt-dlp アップデート追従 ===================
+
+/** 追従するリリースチャンネル。 */
+export type YtdlpChannel = 'stable' | 'nightly';
+
+export type YtdlpUpdateCheck = {
+  channel: YtdlpChannel;
+  /** 今 yt-dlp として使われている実行ファイル。 */
+  currentPath: string;
+  /** その版 (`--version` 実測)。取れなければ null。 */
+  currentVersion: string | null;
+  currentSource: BinarySource;
+  /** リモートの最新版。オフライン等で取れなければ null。 */
+  latestVersion: string | null;
+  releaseUrl: string | null;
+  updateAvailable: boolean;
+  /** アプリが管理している版を入れているか。 */
+  managedInstalled: boolean;
+  managedPath: string | null;
+  /** 同梱 / PATH 版の方が新しいか (= 管理下の物を消した方が良い)。 */
+  fallbackIsNewer: boolean;
+  fallbackVersion: string | null;
+  lastCheckedAt: number | null;
+  /** 取得経路 (`api` / `redirect`)。診断用。 */
+  via: string | null;
+  /** 最新版を取れなかった理由。 */
+  error: string | null;
+};
+
+/** インストールの進行フェーズ。Rust 側 `UpdateProgress.phase` と対。 */
+export type YtdlpUpdatePhase =
+  | 'idle'
+  | 'checking'
+  | 'downloading'
+  | 'verifying'
+  | 'installing'
+  | 'done'
+  | 'error';
+
+export type YtdlpUpdateProgress = {
+  phase: YtdlpUpdatePhase;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  version: string | null;
+  message: string | null;
+};
+
+export type YtdlpInstallResult = {
+  version: string;
+  path: string;
+  bytes: number;
+  /** リリース同梱の SHA2-256SUMS と照合できたか。 */
+  sha256Verified: boolean;
+  channel: YtdlpChannel;
+};
+
+/** 現在の yt-dlp とリモート最新版を調べる。`channel` 省略時は設定値を使う。 */
+export async function ytdlpCheckUpdate(channel?: YtdlpChannel): Promise<YtdlpUpdateCheck> {
+  return invoke<YtdlpUpdateCheck>('ytdlp_check_update', { channel: channel ?? null });
+}
+
+/** 最新版を落として `<app_data_dir>/bin` に入れる。 */
+export async function ytdlpInstallUpdate(channel?: YtdlpChannel): Promise<YtdlpInstallResult> {
+  return invoke<YtdlpInstallResult>('ytdlp_install_update', { channel: channel ?? null });
+}
+
+/** インストール中の進捗。ポーリングして読む。 */
+export async function ytdlpUpdateStatus(): Promise<YtdlpUpdateProgress> {
+  return invoke<YtdlpUpdateProgress>('ytdlp_update_status');
+}
+
+/** 管理下の yt-dlp を消して同梱 / PATH 版に戻す。消す物が無ければ false。 */
+export async function ytdlpRemoveManaged(): Promise<boolean> {
+  return invoke<boolean>('ytdlp_remove_managed');
 }
