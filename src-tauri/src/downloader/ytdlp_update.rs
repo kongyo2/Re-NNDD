@@ -913,9 +913,15 @@ async fn install_update_run(
     }
 
     state.set_phase("installing", Some(&installed_version.to_string()));
-    tokio::fs::rename(&tmp, &dest)
-        .await
-        .map_err(|e| AppError::Other(format!("{} への設置に失敗しました: {e}", dest.display())))?;
+    // `std::fs::rename` は既存ファイルを置き換える (Windows でも
+    // `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)`、失敗時は
+    // `SetFileInformationByHandle` + `FileRenameInfoEx`)。なので「2 回目以降の
+    // 更新で dest が既にある」こと自体は問題にならない。
+    // 問題になるのは Windows で **置き換え先が実行中イメージとして開かれて
+    // いる** 場合で、ここは共有違反で弾かれる。差し替え権 (try_begin_binary_swap)
+    // で長い掴みは排除してあるが、`--version` 程度の一瞬の起動まで数えると
+    // UI が固まるので数えていない。その取りこぼしを短いリトライで吸収する。
+    replace_with_retry(&tmp, &dest).await?;
     // rename でパーミッションは保たれるが、既存ファイルを置換した場合に
     // 備えてもう一度立てておく。
     set_executable(&dest).await?;
@@ -1083,6 +1089,46 @@ async fn set_executable(path: &Path) -> Result<()> {
         let _ = path;
     }
     Ok(())
+}
+
+/// 差し替え (rename) の再試行回数と間隔。
+///
+/// Windows で置き換え先が一瞬だけ開かれている (`--version` 起動など) ケースを
+/// 吸収するためのもの。合計 1 秒ちょっと待って駄目なら諦める。
+const REPLACE_ATTEMPTS: u32 = 5;
+const REPLACE_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+/// `tmp` を `dest` へ差し替える。共有違反などで弾かれたら短くリトライする。
+///
+/// 失敗しても `tmp` はそのまま残る (呼び出し側が消す)。既存の `dest` は
+/// rename が成功したときだけ置き換わるので、途中で諦めても動く yt-dlp が
+/// 消えることはない。
+async fn replace_with_retry(tmp: &Path, dest: &Path) -> Result<()> {
+    let mut last_err = None;
+    for attempt in 1..=REPLACE_ATTEMPTS {
+        match tokio::fs::rename(tmp, dest).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    attempt,
+                    error = %e,
+                    dest = %dest.display(),
+                    "yt-dlp の差し替えに失敗。リトライする"
+                );
+                last_err = Some(e);
+                if attempt < REPLACE_ATTEMPTS {
+                    tokio::time::sleep(REPLACE_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    Err(AppError::Other(format!(
+        "{} への設置に失敗しました ({REPLACE_ATTEMPTS} 回試行): {}",
+        dest.display(),
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    )))
 }
 
 /// 一時ファイル名の接頭辞。この後ろに PID が付く。
@@ -1412,6 +1458,45 @@ notahash  yt-dlp_linux
             "他プロセスが書いている最中の物を消してはいけない"
         );
         assert!(!other_stale.exists(), "十分に古い残骸は消す");
+    }
+
+    // ---- 差し替え (rename) ----
+
+    #[tokio::test]
+    async fn replace_swaps_over_an_existing_destination() {
+        // `fs::rename` は既存ファイルを置き換える (Windows も
+        // MOVEFILE_REPLACE_EXISTING)。2 回目以降の更新で dest が既にあっても
+        // 落ちないことの裏付け。
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("new");
+        let dest = dir.path().join("yt-dlp");
+        tokio::fs::write(&dest, b"old").await.unwrap();
+        tokio::fs::write(&tmp, b"new").await.unwrap();
+
+        replace_with_retry(&tmp, &dest).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"new");
+        assert!(!tmp.exists(), "tmp は移動して消えている");
+    }
+
+    #[tokio::test]
+    async fn replace_reports_the_last_error_after_retrying() {
+        // tmp が無い = 何度やっても失敗するケース。既存の dest は残ること。
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("missing");
+        let dest = dir.path().join("yt-dlp");
+        tokio::fs::write(&dest, b"old").await.unwrap();
+
+        let err = replace_with_retry(&tmp, &dest)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&REPLACE_ATTEMPTS.to_string()), "{err}");
+        assert_eq!(
+            tokio::fs::read(&dest).await.unwrap(),
+            b"old",
+            "諦めても動く yt-dlp を消してはいけない"
+        );
     }
 
     #[tokio::test]

@@ -41,7 +41,12 @@ use crate::local_server::LocalServer;
 #[derive(Default)]
 struct TaskState {
     running: HashMap<i64, watch::Sender<bool>>,
-    /// yt-dlp バイナリの差し替え中。true の間は新規 DL を受け付けない。
+    /// DL キュー以外で yt-dlp を起動している数 (シリーズ一覧の取得など)。
+    ///
+    /// キューに乗らない yt-dlp 起動も、走っている間は実行ファイルを掴む。
+    /// 数えておかないと差し替えが「DL は居ない」と判断して走ってしまう。
+    other_uses: usize,
+    /// yt-dlp バイナリの差し替え中。true の間は新規 DL / 起動を受け付けない。
     swapping_binary: bool,
 }
 
@@ -68,9 +73,16 @@ impl DownloadTasks {
         true
     }
 
+    /// キャンセルを通知する。
+    ///
+    /// **エントリは消さない**。実際に消すのは spawn したタスクが終わるときの
+    /// [`DownloadTasks::remove`]。ここで消すと、yt-dlp がまだ死にきっていない
+    /// のに `try_begin_binary_swap` が「DL は居ない」と判断してしまい、
+    /// Windows で消えかけのプロセスが実行ファイルを掴んだまま rename に
+    /// ぶつかる (Codex review P2)。
     fn cancel(&self, id: i64) {
-        if let Ok(mut state) = self.inner.lock() {
-            if let Some(tx) = state.running.remove(&id) {
+        if let Ok(state) = self.inner.lock() {
+            if let Some(tx) = state.running.get(&id) {
                 let _ = tx.send(true);
             }
         }
@@ -82,22 +94,53 @@ impl DownloadTasks {
         }
     }
 
+    /// DL キュー以外で yt-dlp を起動する前に取る使用権。
+    ///
+    /// シリーズ一覧の取得など、キューに乗らない yt-dlp 起動に使う。差し替え中
+    /// なら `None` (呼び出し側は yt-dlp 経路を諦めて別の手段に落ちる)。
+    ///
+    /// ロックが毒化していたら取らせない (安全側)。
+    pub fn try_use_ytdlp(&self) -> Option<YtdlpUseGuard> {
+        let mut state = self.inner.lock().ok()?;
+        if state.swapping_binary {
+            return None;
+        }
+        state.other_uses += 1;
+        Some(YtdlpUseGuard {
+            tasks: self.clone(),
+        })
+    }
+
     /// yt-dlp の実行ファイルを差し替える権利を取る。
     ///
-    /// 走っている DL が 1 本でもあれば、または既に別の差し替えが進行中なら
-    /// `None`。取れた場合、ガードを持っている間は内部の `insert` が新しい DL
-    /// を弾くので、「確認した後に DL が始まる」隙間が無い。
+    /// 走っている DL・キュー外の yt-dlp 起動が 1 つでもあれば、または既に別の
+    /// 差し替えが進行中なら `None`。取れた場合、ガードを持っている間は内部の
+    /// `insert` / `try_use_ytdlp` が新しい起動を弾くので、「確認した後に
+    /// yt-dlp が動き出す」隙間が無い。
     ///
     /// ロックが毒化していたら取らせない (安全側)。
     pub fn try_begin_binary_swap(&self) -> Option<BinarySwapGuard> {
         let mut state = self.inner.lock().ok()?;
-        if state.swapping_binary || !state.running.is_empty() {
+        if state.swapping_binary || !state.running.is_empty() || state.other_uses > 0 {
             return None;
         }
         state.swapping_binary = true;
         Some(BinarySwapGuard {
             tasks: self.clone(),
         })
+    }
+}
+
+/// キュー外の yt-dlp 起動を数えているあいだ持つガード。
+pub struct YtdlpUseGuard {
+    tasks: DownloadTasks,
+}
+
+impl Drop for YtdlpUseGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.tasks.inner.lock() {
+            state.other_uses = state.other_uses.saturating_sub(1);
+        }
     }
 }
 
@@ -1070,6 +1113,7 @@ pub async fn fetch_series_videos(
     page: u32,
     page_size: u32,
     store: State<'_, Arc<SessionStore>>,
+    tasks: State<'_, DownloadTasks>,
     app: tauri::AppHandle,
 ) -> Result<UserVideosResponse> {
     // series_id は数値のみ。URL へ埋め込む前に検証して注入を防ぐ。
@@ -1133,7 +1177,7 @@ pub async fn fetch_series_videos(
     }
 
     // Step 2: try yt-dlp for video list (fallback)
-    match fetch_series_videos_via_ytdlp(&series_id, cookie, Some(&app)).await {
+    match fetch_series_videos_via_ytdlp(&series_id, cookie, Some(&app), &tasks).await {
         Ok(items) if !items.is_empty() => {
             let total_count = items.len() as i64;
             return Ok(UserVideosResponse {
@@ -1338,7 +1382,17 @@ async fn fetch_series_videos_via_ytdlp(
     series_id: &str,
     cookie_header: Option<String>,
     app: Option<&tauri::AppHandle>,
+    tasks: &DownloadTasks,
 ) -> Result<Vec<UserVideoItem>, AppError> {
+    // ここは DL キューに乗らない yt-dlp 起動なので、使用権を取って差し替えと
+    // 排他する。取れなければ (= 更新中) yt-dlp 経路は諦める。呼び出し側は
+    // HTML スクレイプにフォールバックするので機能は落ちない
+    // (Codex review P2)。
+    let Some(_use_guard) = tasks.try_use_ytdlp() else {
+        return Err(AppError::Other(
+            "yt-dlp の更新中のため、シリーズ一覧の yt-dlp 取得をスキップしました。".into(),
+        ));
+    };
     // `app` を渡さないと managed / bundled が見えず PATH の yt-dlp に落ちる
     // (= 同梱版もアップデート済みの版も無視される) ので必ず AppHandle 経由で解決する。
     let yt = tools::ytdlp(app);
@@ -4089,14 +4143,72 @@ mod tests {
     }
 
     #[test]
-    fn cancel_only_touches_the_named_download() {
+    fn cancel_signals_but_keeps_the_entry_until_the_task_exits() {
         let tasks = DownloadTasks::default();
-        assert!(tasks.insert(1, dummy_tx()));
-        assert!(tasks.insert(2, dummy_tx()));
+        let tx = dummy_tx();
+        let mut watcher = tx.subscribe();
+        assert!(tasks.insert(1, tx));
+
         tasks.cancel(1);
-        // 2 が残っているので差し替えはまだ通らない。
-        assert!(tasks.try_begin_binary_swap().is_none());
-        tasks.cancel(2);
+        // キャンセルは伝わる。
+        assert!(*watcher.borrow_and_update());
+        // が、エントリはまだ残っている。yt-dlp が死にきる前に差し替えを
+        // 許すと Windows で rename が共有違反で落ちる (Codex review P2)。
+        assert!(
+            tasks.try_begin_binary_swap().is_none(),
+            "キャンセル直後 (プロセスが生きている間) に差し替えてはいけない"
+        );
+
+        // spawn したタスクが終わって初めて解放される。
+        tasks.remove(1);
+        assert!(tasks.try_begin_binary_swap().is_some());
+    }
+
+    #[test]
+    fn cancel_of_an_unknown_id_is_a_noop() {
+        let tasks = DownloadTasks::default();
+        tasks.cancel(42);
+        assert!(tasks.try_begin_binary_swap().is_some());
+    }
+
+    // ---- キュー外の yt-dlp 起動 (シリーズ一覧など) ----
+
+    #[test]
+    fn other_ytdlp_uses_block_a_binary_swap() {
+        let tasks = DownloadTasks::default();
+        let use_guard = tasks.try_use_ytdlp().unwrap();
+        assert!(
+            tasks.try_begin_binary_swap().is_none(),
+            "キュー外の yt-dlp が走っている間は差し替えられない"
+        );
+        drop(use_guard);
+        assert!(tasks.try_begin_binary_swap().is_some());
+    }
+
+    #[test]
+    fn other_ytdlp_uses_are_refused_during_a_swap() {
+        let tasks = DownloadTasks::default();
+        let swap = tasks.try_begin_binary_swap().unwrap();
+        assert!(
+            tasks.try_use_ytdlp().is_none(),
+            "差し替え中に yt-dlp を起動させてはいけない"
+        );
+        drop(swap);
+        assert!(tasks.try_use_ytdlp().is_some());
+    }
+
+    #[test]
+    fn other_ytdlp_uses_are_counted_not_flagged() {
+        // 同時に複数走ることがあるので、最後の 1 つが終わるまで解放しない。
+        let tasks = DownloadTasks::default();
+        let a = tasks.try_use_ytdlp().unwrap();
+        let b = tasks.try_use_ytdlp().unwrap();
+        drop(a);
+        assert!(
+            tasks.try_begin_binary_swap().is_none(),
+            "まだ 1 つ走っている"
+        );
+        drop(b);
         assert!(tasks.try_begin_binary_swap().is_some());
     }
 
