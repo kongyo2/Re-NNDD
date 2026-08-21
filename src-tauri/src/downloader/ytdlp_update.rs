@@ -560,12 +560,15 @@ impl Default for UpdateProgress {
     }
 }
 
-/// 進捗 + 「今インストール中か」の排他。
+/// インストールの進捗。
+///
+/// 二重インストール防止と「DL 中に差し替えない」の排他は
+/// [`crate::commands::DownloadTasks::try_begin_binary_swap`] が一手に引き受ける
+/// (走っている DL と同じ Mutex で見ないと check-then-act の隙間が空くため)。
+/// ここは表示用の状態だけを持つ。
 #[derive(Default)]
 pub struct YtdlpUpdateState {
     progress: Mutex<UpdateProgress>,
-    /// 二重インストール防止。`true` の間は新しい install を受け付けない。
-    running: Mutex<bool>,
 }
 
 impl YtdlpUpdateState {
@@ -596,29 +599,6 @@ impl YtdlpUpdateState {
         let mut p = self.progress.lock();
         p.phase = "error".into();
         p.message = Some(message);
-    }
-
-    /// 実行権を取る。既に走っていれば `None`。
-    fn try_acquire(self: &Arc<Self>) -> Option<RunGuard> {
-        let mut running = self.running.lock();
-        if *running {
-            return None;
-        }
-        *running = true;
-        Some(RunGuard {
-            state: Arc::clone(self),
-        })
-    }
-}
-
-/// `running` フラグを必ず降ろすためのガード (途中 `?` で抜けても戻る)。
-struct RunGuard {
-    state: Arc<YtdlpUpdateState>,
-}
-
-impl Drop for RunGuard {
-    fn drop(&mut self) {
-        *self.state.running.lock() = false;
     }
 }
 
@@ -813,18 +793,16 @@ async fn install_update_inner(
     tasks: &crate::commands::DownloadTasks,
     app: &tauri::AppHandle,
 ) -> Result<YtdlpInstallResult> {
-    let Some(_guard) = state.try_acquire() else {
+    // 差し替え権をここで取る。二重インストール防止と「DL 中に差し替えない」
+    // を 1 つのロックで同時に満たす。ガードを持っている間は新しい DL も
+    // 弾かれるので、確認した後に DL が始まる隙間が無い。
+    let Some(_swap) = tasks.try_begin_binary_swap() else {
         return Err(AppError::Other(
-            "yt-dlp のアップデートは既に実行中です。".into(),
+            "yt-dlp を更新できません。実行中のダウンロード、または別の更新の\
+             完了を待ってからやり直してください。"
+                .into(),
         ));
     };
-    // DL 中に実行ファイルを差し替えると、Windows では rename が失敗し、
-    // Unix でも走っている yt-dlp と入れ替わった版が混ざって混乱する。
-    if !tasks.is_idle() {
-        return Err(AppError::Other(
-            "ダウンロード中は yt-dlp を更新できません。完了かキャンセルを待ってください。".into(),
-        ));
-    }
 
     let result = install_update_run(channel, library, state, app).await;
     match &result {
@@ -875,7 +853,7 @@ async fn install_update_run(
     let dest = dir.join(tools::exe_file_name("yt-dlp"));
     // 前回の中断で残った物を掃除しておく (残しても実害はないが容量を食う)。
     cleanup_temp_files(&dir).await;
-    let tmp = dir.join(format!("yt-dlp.download-{}", std::process::id()));
+    let tmp = dir.join(format!("{TEMP_PREFIX}{}", std::process::id()));
 
     state.set_phase("downloading", Some(&version_str));
     let expected = client.expected_sha256(&release).await;
@@ -984,12 +962,18 @@ pub async fn ytdlp_remove_managed(
     tasks: State<'_, crate::commands::DownloadTasks>,
     app: tauri::AppHandle,
 ) -> Result<bool> {
-    if !tasks.is_idle() {
+    // インストールと同じ差し替え権を取る。これを取らずに消すと、
+    // 走っているインストールが rename した直後・成功を記録する前に消えて
+    // 「成功したのに実行ファイルが無い」状態になったり、逆に消した直後に
+    // インストールがファイルを作り直して「同梱版に戻した」が嘘になる
+    // (Codex review P2)。
+    let Some(_swap) = tasks.try_begin_binary_swap() else {
         return Err(AppError::Other(
-            "ダウンロード中は yt-dlp を差し替えられません。完了かキャンセルを待ってください。"
+            "yt-dlp を差し替えられません。実行中のダウンロード、または更新の\
+             完了を待ってからやり直してください。"
                 .into(),
         ));
-    }
+    };
     let Some(path) = tools::managed_path(Some(&app), "yt-dlp") else {
         return Ok(false);
     };
@@ -1101,16 +1085,51 @@ async fn set_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 一時ファイル名の接頭辞。この後ろに PID が付く。
+const TEMP_PREFIX: &str = "yt-dlp.download-";
+
+/// 他プロセスの一時ファイルを「もう誰も書いていない」と見なす経過時間。
+///
+/// アップデートの DL は普通 1 分もかからないので、1 時間放置されている物は
+/// 中断された残骸と判断してよい。
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
+
 /// 中断で残った `yt-dlp.download-*` を掃除する。
+///
+/// 消すのは自分の PID の物か、十分に古い物だけ。差し替え権
+/// ([`crate::commands::DownloadTasks::try_begin_binary_swap`]) はプロセス内の
+/// 排他しか効かないので、アプリを 2 つ起動していると片方の掃除が、もう片方が
+/// 今まさに書いている `yt-dlp.download-<相手の PID>` を消してしまう。Unix では
+/// 書き込み自体は続くが、その後の chmod / rename がパス消失で失敗する
+/// (Codex review P2)。
 async fn cleanup_temp_files(dir: &Path) {
+    let own = format!("{TEMP_PREFIX}{}", std::process::id());
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with("yt-dlp.download-") {
-            let _ = tokio::fs::remove_file(entry.path()).await;
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.starts_with(TEMP_PREFIX) {
+            continue;
         }
+        // 自分の残骸は無条件に消してよい (このプロセスで書いている物は
+        // 今から作る物だけで、それはまだ存在しない)。
+        if name != own {
+            // 他プロセスの物は、十分に古い場合だけ。mtime が読めない・
+            // 未来の場合は触らない (安全側)。
+            let fresh = entry
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|age| age < STALE_TEMP_AGE);
+            if fresh {
+                continue;
+            }
+        }
+        let _ = tokio::fs::remove_file(entry.path()).await;
     }
 }
 
@@ -1359,31 +1378,40 @@ notahash  yt-dlp_linux
         assert_eq!(p.version.as_deref(), Some("2026.08.19"));
     }
 
-    #[test]
-    fn run_guard_is_exclusive_and_released() {
-        let state = Arc::new(YtdlpUpdateState::default());
-        let g = state.try_acquire();
-        assert!(g.is_some());
-        assert!(state.try_acquire().is_none(), "二重取得できてはいけない");
-        drop(g);
-        assert!(state.try_acquire().is_some(), "drop で解放されるべき");
-    }
-
     // ---- 一時ファイル掃除 ----
 
+    /// `path` の mtime を `age` だけ過去にずらす。
+    fn age_file(path: &Path, age: Duration) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        let when = std::time::SystemTime::now() - age;
+        f.set_modified(when).unwrap();
+    }
+
     #[tokio::test]
-    async fn cleanup_removes_only_download_temporaries() {
+    async fn cleanup_removes_own_and_stale_temporaries_only() {
         let dir = tempfile::tempdir().unwrap();
-        let keep = dir.path().join("yt-dlp");
-        let drop1 = dir.path().join("yt-dlp.download-123");
-        let drop2 = dir.path().join("yt-dlp.download-456");
-        for p in [&keep, &drop1, &drop2] {
+        let keep_binary = dir.path().join("yt-dlp");
+        let own = dir
+            .path()
+            .join(format!("{TEMP_PREFIX}{}", std::process::id()));
+        // 別プロセスが「今まさに書いている」物。消してはいけない。
+        let other_fresh = dir.path().join(format!("{TEMP_PREFIX}999999"));
+        // 別プロセスが中断して置いていった物。消してよい。
+        let other_stale = dir.path().join(format!("{TEMP_PREFIX}999998"));
+        for p in [&keep_binary, &own, &other_fresh, &other_stale] {
             tokio::fs::write(p, b"x").await.unwrap();
         }
+        age_file(&other_stale, STALE_TEMP_AGE + Duration::from_secs(60));
+
         cleanup_temp_files(dir.path()).await;
-        assert!(keep.exists(), "本体は消してはいけない");
-        assert!(!drop1.exists());
-        assert!(!drop2.exists());
+
+        assert!(keep_binary.exists(), "本体は消してはいけない");
+        assert!(!own.exists(), "自分の残骸は消す");
+        assert!(
+            other_fresh.exists(),
+            "他プロセスが書いている最中の物を消してはいけない"
+        );
+        assert!(!other_stale.exists(), "十分に古い残骸は消す");
     }
 
     #[tokio::test]
