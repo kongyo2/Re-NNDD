@@ -85,8 +85,8 @@ impl DownloadTasks {
     /// yt-dlp の実行ファイルを差し替える権利を取る。
     ///
     /// 走っている DL が 1 本でもあれば、または既に別の差し替えが進行中なら
-    /// `None`。取れた場合、ガードを持っている間は [`DownloadTasks::insert`]
-    /// が新しい DL を弾くので、「確認した後に DL が始まる」隙間が無い。
+    /// `None`。取れた場合、ガードを持っている間は内部の `insert` が新しい DL
+    /// を弾くので、「確認した後に DL が始まる」隙間が無い。
     ///
     /// ロックが毒化していたら取らせない (安全側)。
     pub fn try_begin_binary_swap(&self) -> Option<BinarySwapGuard> {
