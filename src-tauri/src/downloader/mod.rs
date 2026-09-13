@@ -15,3 +15,4 @@ pub mod mux;
 pub mod run;
 pub mod tools;
 pub mod ytdlp;
+pub mod ytdlp_update;

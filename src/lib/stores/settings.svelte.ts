@@ -164,6 +164,40 @@ export const SETTING_DEFS = [
     ],
     order: 20,
   },
+  // --- yt-dlp のアップデート追従 ---
+  // キーは Rust 側 `downloader::ytdlp_update` の KEY_* と対。片方だけ変えると
+  // 起動時の自動チェックと設定画面が別の値を見に行くので必ず揃えること。
+  {
+    key: 'ytdlp.update_channel',
+    label: 'yt-dlp の追従チャンネル',
+    description: 'nightly は niconico の仕様変更への追従が早いが、不安定なこともある',
+    section: 'download',
+    default: 'stable',
+    kind: 'select',
+    options: [
+      { value: 'stable', label: '安定版 (stable)' },
+      { value: 'nightly', label: '毎日ビルド (nightly)' },
+    ],
+    order: 30,
+  },
+  {
+    key: 'ytdlp.auto_check',
+    label: 'yt-dlp の更新を自動で確認',
+    description: '起動時に 1 日 1 回まで確認する (インストールはしない)',
+    section: 'download',
+    default: true,
+    kind: 'bool',
+    order: 40,
+  },
+  {
+    key: 'ytdlp.auto_install',
+    label: 'yt-dlp を自動で更新',
+    description: '新しい版が見つかったら確認なしでインストールする',
+    section: 'download',
+    default: false,
+    kind: 'bool',
+    order: 50,
+  },
 
   // === ライブラリ ===
   {
