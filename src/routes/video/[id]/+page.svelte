@@ -343,7 +343,6 @@
     currentTime = time;
     if (payload && time > 0) {
       saveResumePosition(payload.video.id, time);
-      maybeRecordView(payload);
     }
     // PiP 音声引き継ぎ中 (mini が無音ロード中) は、ページ側 currentTime を
     // 共有ストアに書き続ける。mini は引き継ぎ瞬間にこの値へシークすることで
@@ -687,6 +686,7 @@
               refreshHlsUrl={() => issueHlsUrl(p.videoId)}
               onTime={handleTimeUpdate}
               onEnded={handleEnded}
+              onPlaybackStart={() => maybeRecordView(p)}
               resumePosition={getResumePosition(p.videoId)}
               {loop}
               onLoopChange={(v) => {
