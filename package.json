@@ -21,7 +21,6 @@
   },
   "dependencies": {
     "@kongyo2/nicoran-api": "^0.1.1",
-    "@kongyo2/nicotag-api": "^0.1.0",
     "@tauri-apps/api": "^2.1.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-shell": "^2.0.0",
