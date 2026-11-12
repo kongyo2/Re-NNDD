@@ -12,7 +12,6 @@
     issueHlsUrl,
     preparePlayback,
     recordWatchView,
-    saveNiconicoPlaybackPosition,
     type ContentsTree,
     type ContentsTreeVideo,
     type SearchHit,
@@ -31,6 +30,8 @@
   import { getBool, getStr, loadSettings } from '$lib/stores/settings.svelte';
   import { sanitizeDescriptionHtml } from '$lib/sanitize';
   import { miniPlayer } from '$lib/player/miniPlayerStore.svelte';
+  import { PositionSync, positionSyncInfoOf } from '$lib/player/positionSync';
+  import { storyboardRefreshDelay } from '$lib/player/storyboard';
   import {
     advanceQueue,
     getQueue,
@@ -226,54 +227,57 @@
   }
 
   // ---- 再生位置のニコニコへの保存 (オプション機能) ----
-  // Web プレイヤーと同じく、ログイン中かつ通常視聴 (okReason=PURELY) の時だけ、
-  // 一時停止・終了 (0 秒)・ページ移動で送る。開いただけで再生していない動画は送らない
-  // (他の端末で保存した位置を 0 で上書きしてしまうため)。
-  let positionSyncArmedFor: string | null = null;
-  let lastSavedPosition: { videoId: string; seconds: number } | null = null;
-  // 最後まで見た動画。見終わった後にページを離れても終端の位置で上書きせず、0 秒の
-  // ままにする (Web プレイヤーも終了後は 0 を送る)。巻き戻したら解除する。
-  let endedFor: string | null = null;
-
-  function canSyncPosition(p: PlaybackPayload): boolean {
-    return (
-      getBool('playback.sync_niconico_position') &&
-      getBool('playback.record_niconico_view') &&
-      !p.isGuest &&
-      !p.sessionExpired &&
-      p.okReason === 'PURELY'
-    );
-  }
-
-  function savePosition(p: PlaybackPayload, seconds: number) {
-    if (positionSyncArmedFor !== p.videoId || !canSyncPosition(p)) return;
-    const s = endedFor === p.videoId ? 0 : Math.max(0, Math.floor(seconds));
-    if (lastSavedPosition?.videoId === p.videoId && lastSavedPosition.seconds === s) return;
-    lastSavedPosition = { videoId: p.videoId, seconds: s };
-    saveNiconicoPlaybackPosition(p.videoId, s).catch((e) => {
-      console.warn('save playback position failed', e);
-    });
-  }
+  // 規則は `positionSync.ts` (ミニプレイヤーと共通)。PiP に引き継いだ後はミニ
+  // プレイヤー側が送る。
+  const positionSync = new PositionSync();
 
   function onPlaybackStarted(p: PlaybackPayload) {
-    positionSyncArmedFor = p.videoId;
+    positionSync.started();
     maybeRecordView(p);
   }
 
   beforeNavigate(() => {
-    if (payload) savePosition(payload, currentTime);
+    positionSync.saveAt(currentTime);
   });
   onDestroy(() => {
-    if (payload) savePosition(payload, currentTime);
+    positionSync.saveAt(currentTime);
+    clearStoryboardRefresh();
   });
+
+  // ---- シーンサムネイル ----
+  // 画像の署名は 3 時間で切れるので、切れる少し前に取り直す (鍵が失効していれば
+  // Rust 側が視聴データを取り直す)。
+  let storyboardRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearStoryboardRefresh() {
+    if (storyboardRefreshTimer) clearTimeout(storyboardRefreshTimer);
+    storyboardRefreshTimer = null;
+  }
+
+  function loadStoryboard(id: string, p: PlaybackPayload) {
+    fetchStoryboard(p.videoId, p.accessRightKey, p.actionTrackId)
+      .then((sb) => {
+        if (loadingFor !== id) return;
+        storyboard = sb;
+        clearStoryboardRefresh();
+        const delay = storyboardRefreshDelay(sb?.expireTime, Date.now());
+        if (delay != null) {
+          storyboardRefreshTimer = setTimeout(() => {
+            if (loadingFor === id) loadStoryboard(id, p);
+          }, delay);
+        }
+      })
+      .catch((e) => {
+        console.warn('storyboard fetch failed', e);
+      });
+  }
 
   async function load(id: string) {
     if (!id) return;
     loadingFor = id;
     viewRecordedFor = null;
-    positionSyncArmedFor = null;
-    lastSavedPosition = null;
-    endedFor = null;
+    positionSync.reset(null);
+    clearStoryboardRefresh();
     pending = true;
     error = null;
     payload = null;
@@ -320,17 +324,12 @@
           });
       }
 
+      positionSync.reset(result.videoId, positionSyncInfoOf(result));
+
       // シーンサムネイル: 初期のバッファリングと競合しないよう少し遅らせて取る。
       if (result.storyboardAvailable && getBool('player.storyboard_preview')) {
         setTimeout(() => {
-          if (loadingFor !== id) return;
-          fetchStoryboard(result.videoId, result.accessRightKey, result.actionTrackId)
-            .then((sb) => {
-              if (loadingFor === id) storyboard = sb;
-            })
-            .catch((e) => {
-              console.warn('storyboard fetch failed', e);
-            });
+          if (loadingFor === id) loadStoryboard(id, result);
         }, 1500);
       }
 
@@ -407,10 +406,7 @@
 
   function handleEnded() {
     // 見終わった動画は 0 秒で保存する (Web プレイヤーと同じ)。
-    if (payload) {
-      endedFor = payload.videoId;
-      savePosition(payload, 0);
-    }
+    positionSync.finished();
     if (!getBool('playback.autoplay_queue')) return;
     const q = getQueue();
     if (!q) return;
@@ -453,10 +449,7 @@
 
   function handleTimeUpdate(time: number) {
     currentTime = time;
-    // 見終わった後に巻き戻して見直し始めたら、また今の位置を保存する。
-    if (payload && endedFor === payload.videoId && time < payload.video.duration - 2) {
-      endedFor = null;
-    }
+    positionSync.timeUpdate(time);
     if (payload && time > 0) {
       saveResumePosition(payload.video.id, time);
     }
@@ -539,12 +532,17 @@
         /* ignore */
       }
     }
+    // 再生位置の保存はミニプレイヤーへ引き継ぐ。このページの Player が再び再生を
+    // 始めるまで、ここからは送らない (引き継ぎ時点の古い位置で上書きしないため)。
+    positionSync.saveAt(t);
+    positionSync.handOff();
     miniPlayer.open({
       source: {
         kind: 'online',
         videoId: snapVideoId,
         hlsUrl: snapHlsUrl,
         refreshHlsUrl: () => issueHlsUrl(snapVideoId),
+        niconicoPosition: positionSyncInfoOf(payload),
       },
       title: snapTitle,
       comments: visibleComments,
@@ -831,7 +829,7 @@
               onTime={handleTimeUpdate}
               onEnded={handleEnded}
               onPlaybackStart={() => onPlaybackStarted(p)}
-              onPause={(t) => savePosition(p, t)}
+              onPause={(t) => positionSync.saveAt(t)}
               {storyboard}
               resumePosition={getResumePosition(p.videoId, p)}
               {loop}

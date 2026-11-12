@@ -64,6 +64,25 @@ export function storyboardFrameAt(
   };
 }
 
+/** 期限のどれだけ前に取り直すか。 */
+const REFRESH_MARGIN_MS = 5 * 60 * 1000;
+/** 期限が近すぎる・過ぎている時も、取り直しを連打しないよう最低これだけ待つ。 */
+const MIN_REFRESH_DELAY_MS = 60 * 1000;
+
+/**
+ * 画像の署名 (`expireTime`、発行から 3 時間) が切れる少し前に取り直すまでの待ち時間
+ * (ミリ秒)。期限が分からなければ `null` (取り直さない)。
+ */
+export function storyboardRefreshDelay(
+  expireTime: string | undefined,
+  nowMs: number,
+): number | null {
+  if (!expireTime) return null;
+  const at = Date.parse(expireTime);
+  if (!Number.isFinite(at)) return null;
+  return Math.max(MIN_REFRESH_DELAY_MS, at - nowMs - REFRESH_MARGIN_MS);
+}
+
 /** CSS の `url(...)` に入れられる形にする (二重引用符だけ逃がせば十分)。 */
 export function cssUrl(url: string): string {
   return `url("${url.replace(/"/g, '%22')}")`;

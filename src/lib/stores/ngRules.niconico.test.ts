@@ -48,13 +48,27 @@ describe('ignoreCase', () => {
   });
 });
 
+describe('ignoreNewlines', () => {
+  it('keeps newlines significant when unset', () => {
+    expect(compileRule(rule({ pattern: 'spoiler' }))!('spo\niler')).toBe(false);
+  });
+
+  it('matches across removed newlines like niconico does', () => {
+    const m = compileRule(rule({ pattern: 'spoiler', ignoreCase: true, ignoreNewlines: true }))!;
+    expect(m('SPO\nILER')).toBe(true);
+    expect(m('spo\r\niler!')).toBe(true);
+    expect(m('spo iler')).toBe(false);
+  });
+});
+
 describe('niconicoNgToRule', () => {
-  it('maps word to a case-insensitive partial comment rule', () => {
+  it('maps word to a case- and newline-insensitive partial comment rule', () => {
     expect(niconicoNgToRule({ type: 'word', source: 'ネタバレ' })).toEqual({
       targetType: 'comment_body',
       matchMode: 'partial',
       pattern: 'ネタバレ',
       ignoreCase: true,
+      ignoreNewlines: true,
       scopeComment: true,
       scopeRanking: false,
       scopeSearch: false,
@@ -113,6 +127,32 @@ describe('importNiconicoNg', () => {
       { content: 'fine', userId: 'nvc:other' },
     ]);
     expect(kept).toEqual([{ content: 'fine', userId: 'nvc:other' }]);
+  });
+
+  it('only treats rules with the same matching semantics as duplicates', () => {
+    // 大文字小文字を区別する同じパターンの手動ルールがあっても、取り込みは別に足す。
+    addNgRule({
+      targetType: 'comment_body',
+      matchMode: 'partial',
+      pattern: 'SPOILER',
+      scopeRanking: false,
+      scopeSearch: false,
+      scopeComment: true,
+      enabled: true,
+    });
+    expect(importNiconicoNg([{ type: 'word', source: 'SPOILER' }])).toEqual({
+      added: 1,
+      duplicates: 0,
+      unsupported: 0,
+    });
+    // 取り込んだものと同じなら登録済み。
+    expect(importNiconicoNg([{ type: 'word', source: 'SPOILER' }])).toEqual({
+      added: 0,
+      duplicates: 1,
+      unsupported: 0,
+    });
+    const kept = filterComments(listNgRules(), [{ content: 'a spoiler here' }, { content: 'ok' }]);
+    expect(kept).toEqual([{ content: 'ok' }]);
   });
 
   it('does not write when nothing is added', () => {

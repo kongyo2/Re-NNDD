@@ -380,7 +380,16 @@
             <td>{TARGET_LABELS[r.targetType]}</td>
             <td>
               {MODE_LABELS[r.matchMode]}
-              {#if r.ignoreCase}<div class="muted small">大文字小文字を区別しない</div>{/if}
+              {#if r.ignoreCase || r.ignoreNewlines}
+                <div class="muted small">
+                  {[
+                    r.ignoreCase ? '大文字小文字を区別しない' : '',
+                    r.ignoreNewlines ? '改行を無視' : '',
+                  ]
+                    .filter(Boolean)
+                    .join('・')}
+                </div>
+              {/if}
             </td>
             <td class="pattern">
               <code>{r.pattern}</code>

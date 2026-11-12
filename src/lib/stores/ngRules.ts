@@ -40,6 +40,9 @@ export type NgRule = {
   /** 大文字小文字を区別しない (ニコニコの NG 設定から取り込んだ word など)。
    *  未指定なら区別する (従来どおり)。 */
   ignoreCase?: boolean;
+  /** 改行を取り除いてから照合する (ニコニコの NG 設定から取り込んだ word。
+   *  ニコニコは改行を除いた本文で判定する)。未指定なら従来どおり。 */
+  ignoreNewlines?: boolean;
   note?: string;
   createdAt: number;
   hitCount: number;
@@ -110,6 +113,7 @@ export function importNgRules(rules: Partial<NgRule>[]): number {
       enabled: r.enabled ?? true,
       tagKind: r.tagKind,
       ignoreCase: r.ignoreCase === true ? true : undefined,
+      ignoreNewlines: r.ignoreNewlines === true ? true : undefined,
       note: r.note,
       createdAt: Date.now(),
       hitCount: 0,
@@ -140,8 +144,9 @@ export const NICONICO_NG_NOTE = 'ニコニコの NG 設定から取り込み';
 
 /**
  * ニコニコの NG 1 件をローカルのルールへ写す。判定は Web プレイヤーに合わせる:
- * `word` は本文の部分一致で大文字小文字を区別しない、`id` はコメントの userId と一致。
- * `command` (コマンドの全トークン一致) はローカルに対応する種別が無いので `null`。
+ * `word` は改行を除いた本文の部分一致で大文字小文字を区別しない、`id` はコメントの
+ * userId と一致。`command` (コマンドの全トークン一致) はローカルに対応する種別が
+ * 無いので `null`。
  */
 export function niconicoNgToRule(
   item: NiconicoNgItemLike,
@@ -157,7 +162,13 @@ export function niconicoNgToRule(
   };
   switch (item.type) {
     case 'word':
-      return { ...base, targetType: 'comment_body', matchMode: 'partial', ignoreCase: true };
+      return {
+        ...base,
+        targetType: 'comment_body',
+        matchMode: 'partial',
+        ignoreCase: true,
+        ignoreNewlines: true,
+      };
     case 'id':
       return { ...base, targetType: 'comment_user', matchMode: 'exact' };
     default:
@@ -167,12 +178,22 @@ export function niconicoNgToRule(
 
 /**
  * ニコニコの NG をローカルへ取り込む。足すだけで、ローカルのルールは消さない。
- * 同じターゲット・モード・パターンのルールが既にあれば足さない。
+ * 照合のしかた (ターゲット・モード・パターン・大文字小文字・改行の扱い) まで同じ
+ * ルールが既にある時だけ足さない (例えば大文字小文字を区別する同じパターンのルールが
+ * あっても、区別しないルールは別に足す)。
  */
 export function importNiconicoNg(items: readonly NiconicoNgItemLike[]): NiconicoNgImportResult {
   const list = read();
-  const keyOf = (r: Pick<NgRule, 'targetType' | 'matchMode' | 'pattern'>) =>
-    `${r.targetType}\u0000${r.matchMode}\u0000${r.pattern}`;
+  const keyOf = (
+    r: Pick<NgRule, 'targetType' | 'matchMode' | 'pattern' | 'ignoreCase' | 'ignoreNewlines'>,
+  ) =>
+    [
+      r.targetType,
+      r.matchMode,
+      r.pattern,
+      r.ignoreCase === true ? 'i' : '',
+      r.ignoreNewlines === true ? 'n' : '',
+    ].join('\u0000');
   const existing = new Set(list.map(keyOf));
   const result: NiconicoNgImportResult = { added: 0, duplicates: 0, unsupported: 0 };
   const now = Date.now();
@@ -203,6 +224,12 @@ export function importNiconicoNg(items: readonly NiconicoNgItemLike[]): Niconico
 /** Compile a rule into a matcher function. Invalid regex returns `null`. */
 export function compileRule(rule: NgRule): ((value: string) => boolean) | null {
   if (!rule.enabled) return null;
+  const match = compileMatcher(rule);
+  if (!match || rule.ignoreNewlines !== true) return match;
+  return (v) => match(v.replace(/[\r\n]/g, ''));
+}
+
+function compileMatcher(rule: NgRule): ((value: string) => boolean) | null {
   const ignoreCase = rule.ignoreCase === true;
   switch (rule.matchMode) {
     case 'exact': {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Storyboard } from '$lib/api';
-import { cssUrl, storyboardFrameAt } from './storyboard';
+import { cssUrl, storyboardFrameAt, storyboardRefreshDelay } from './storyboard';
 
 // 2026-11 に sm9 (320 秒) で取れた形: 120×90 のコマを 10×10、2 秒おき、2 枚。
 const SB: Storyboard = {
@@ -50,6 +50,26 @@ describe('storyboardFrameAt', () => {
     expect(storyboardFrameAt({ ...SB, columns: 0 }, 10)).toBeNull();
     expect(storyboardFrameAt({ ...SB, intervalMs: 0 }, 10)).toBeNull();
     expect(storyboardFrameAt(SB, Number.NaN)).toBeNull();
+  });
+});
+
+describe('storyboardRefreshDelay', () => {
+  const now = Date.parse('2026-11-12T20:25:36+09:00');
+
+  it('refreshes five minutes before the signature expires', () => {
+    expect(storyboardRefreshDelay('2026-11-12T23:25:36+09:00', now)).toBe(
+      3 * 60 * 60 * 1000 - 5 * 60 * 1000,
+    );
+  });
+
+  it('waits at least a minute when the expiry is near or past', () => {
+    expect(storyboardRefreshDelay('2026-11-12T20:27:36+09:00', now)).toBe(60 * 1000);
+    expect(storyboardRefreshDelay('2026-11-12T19:00:00+09:00', now)).toBe(60 * 1000);
+  });
+
+  it('does not schedule anything without a readable expiry', () => {
+    expect(storyboardRefreshDelay(undefined, now)).toBeNull();
+    expect(storyboardRefreshDelay('not a date', now)).toBeNull();
   });
 });
 
