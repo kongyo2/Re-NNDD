@@ -37,6 +37,9 @@ export type NgRule = {
   enabled: boolean;
   /** `targetType === 'tag'` のときのみ意味を持つ。未指定なら `both`。 */
   tagKind?: NgTagKind;
+  /** 大文字小文字を区別しない (ニコニコの NG 設定から取り込んだ word など)。
+   *  未指定なら区別する (従来どおり)。 */
+  ignoreCase?: boolean;
   note?: string;
   createdAt: number;
   hitCount: number;
@@ -106,6 +109,7 @@ export function importNgRules(rules: Partial<NgRule>[]): number {
       scopeComment: r.scopeComment ?? true,
       enabled: r.enabled ?? true,
       tagKind: r.tagKind,
+      ignoreCase: r.ignoreCase === true ? true : undefined,
       note: r.note,
       createdAt: Date.now(),
       hitCount: 0,
@@ -116,17 +120,104 @@ export function importNgRules(rules: Partial<NgRule>[]): number {
   return added;
 }
 
+/* ------------------------------------------------------------------------ */
+/*  ニコニコ側の視聴者 NG 設定の取り込み (オプション機能)。                    */
+/* ------------------------------------------------------------------------ */
+
+/** `fetch_niconico_ng_settings` の 1 件 (`type` は `word` / `id` / `command`)。 */
+export type NiconicoNgItemLike = { type: string; source: string };
+
+export type NiconicoNgImportResult = {
+  /** 新しく足したルール数 */
+  added: number;
+  /** 同じルールが既にあって足さなかった数 */
+  duplicates: number;
+  /** ローカルに対応する種別が無くて取り込めなかった数 (`command` など) */
+  unsupported: number;
+};
+
+export const NICONICO_NG_NOTE = 'ニコニコの NG 設定から取り込み';
+
+/**
+ * ニコニコの NG 1 件をローカルのルールへ写す。判定は Web プレイヤーに合わせる:
+ * `word` は本文の部分一致で大文字小文字を区別しない、`id` はコメントの userId と一致。
+ * `command` (コマンドの全トークン一致) はローカルに対応する種別が無いので `null`。
+ */
+export function niconicoNgToRule(
+  item: NiconicoNgItemLike,
+): Omit<NgRule, 'id' | 'createdAt' | 'hitCount'> | null {
+  if (!item.source || !item.source.trim()) return null;
+  const base = {
+    pattern: item.source,
+    scopeComment: true,
+    scopeRanking: false,
+    scopeSearch: false,
+    enabled: true,
+    note: NICONICO_NG_NOTE,
+  };
+  switch (item.type) {
+    case 'word':
+      return { ...base, targetType: 'comment_body', matchMode: 'partial', ignoreCase: true };
+    case 'id':
+      return { ...base, targetType: 'comment_user', matchMode: 'exact' };
+    default:
+      return null;
+  }
+}
+
+/**
+ * ニコニコの NG をローカルへ取り込む。足すだけで、ローカルのルールは消さない。
+ * 同じターゲット・モード・パターンのルールが既にあれば足さない。
+ */
+export function importNiconicoNg(items: readonly NiconicoNgItemLike[]): NiconicoNgImportResult {
+  const list = read();
+  const keyOf = (r: Pick<NgRule, 'targetType' | 'matchMode' | 'pattern'>) =>
+    `${r.targetType}\u0000${r.matchMode}\u0000${r.pattern}`;
+  const existing = new Set(list.map(keyOf));
+  const result: NiconicoNgImportResult = { added: 0, duplicates: 0, unsupported: 0 };
+  const now = Date.now();
+  for (const item of items) {
+    const rule = niconicoNgToRule(item);
+    if (!rule) {
+      result.unsupported += 1;
+      continue;
+    }
+    const key = keyOf(rule);
+    if (existing.has(key)) {
+      result.duplicates += 1;
+      continue;
+    }
+    existing.add(key);
+    list.push({
+      ...rule,
+      id: `ng_${now}_${Math.random().toString(36).slice(2, 8)}_${result.added}`,
+      createdAt: now,
+      hitCount: 0,
+    });
+    result.added += 1;
+  }
+  if (result.added > 0) write(list);
+  return result;
+}
+
 /** Compile a rule into a matcher function. Invalid regex returns `null`. */
 export function compileRule(rule: NgRule): ((value: string) => boolean) | null {
   if (!rule.enabled) return null;
+  const ignoreCase = rule.ignoreCase === true;
   switch (rule.matchMode) {
-    case 'exact':
-      return (v) => v === rule.pattern;
-    case 'partial':
-      return (v) => v.includes(rule.pattern);
+    case 'exact': {
+      if (!ignoreCase) return (v) => v === rule.pattern;
+      const pattern = rule.pattern.toLowerCase();
+      return (v) => v.toLowerCase() === pattern;
+    }
+    case 'partial': {
+      if (!ignoreCase) return (v) => v.includes(rule.pattern);
+      const pattern = rule.pattern.toLowerCase();
+      return (v) => v.toLowerCase().includes(pattern);
+    }
     case 'regex': {
       try {
-        const re = new RegExp(rule.pattern);
+        const re = new RegExp(rule.pattern, ignoreCase ? 'i' : '');
         return (v) => re.test(v);
       } catch {
         return null;
